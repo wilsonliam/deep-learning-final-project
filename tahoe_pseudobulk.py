@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import datetime
 import gzip
 import logging
 import os
 import pickle
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -47,6 +49,12 @@ class PseudobulkGroup:
     sum_vector: np.ndarray
     n_cells: int
     first_obs: dict
+
+
+def group_mean_vector(group: PseudobulkGroup) -> np.ndarray:
+    if group.n_cells <= 0:
+        return np.zeros_like(group.sum_vector)
+    return (group.sum_vector / float(group.n_cells)).astype(np.float32, copy=False)
 
 
 def parse_args() -> argparse.Namespace:
@@ -139,6 +147,14 @@ def parse_args() -> argparse.Namespace:
         help="Write one compressed file containing the full dict of per-cell-line AnnData objects.",
     )
     return parser.parse_args()
+
+
+def check_file_exists_and_fail(file_path: Path, operation_name: str = "output") -> None:
+    """Check if a file already exists and exit if it does to prevent overwriting."""
+    if file_path.exists():
+        print(f"ERROR: {operation_name} file already exists at {file_path}", file=sys.stderr)
+        print(f"To avoid overwriting, please provide a different --output-dir.", file=sys.stderr)
+        raise FileExistsError(f"{operation_name} file already exists: {file_path}")
 
 
 def configure_logging(output_dir: Path) -> logging.Logger:
@@ -647,7 +663,7 @@ def build_cell_line_adata_collection(
                 n_cells.append(0)
                 observed.append(False)
             else:
-                rows.append(group.sum_vector)
+                rows.append(group_mean_vector(group))
                 n_cells.append(int(group.n_cells))
                 observed.append(True)
 
@@ -684,12 +700,15 @@ def write_cell_line_outputs(
     output_dir: Path,
 ) -> pd.DataFrame:
     cell_line_dir = output_dir / "cell_line_pseudobulk_h5ad"
+    check_file_exists_and_fail(cell_line_dir, "cell_line_pseudobulk_h5ad directory")
     cell_line_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_rows = []
     for cell_line_id, adata in sorted(cell_line_to_adata.items()):
         safe_name = f"cellline={cell_line_id}".replace("/", "_").replace(" ", "_")
         file_path = cell_line_dir / f"{safe_name}.h5ad"
+        if file_path.exists():
+            raise FileExistsError(f"h5ad file already exists for cell line {cell_line_id}: {file_path}")
         adata.write_h5ad(file_path)
         manifest_rows.append(
             {
@@ -711,6 +730,7 @@ def write_cell_line_collection_pickle(
     output_dir: Path,
 ) -> Path:
     collection_path = output_dir / "cell_line_adata_collection.pkl.gz"
+    check_file_exists_and_fail(collection_path, "cell_line_adata_collection.pkl.gz")
     payload = {
         "format": "cell_line_to_anndata_dict_v1",
         "cell_lines": sorted(cell_line_to_adata.keys()),
@@ -852,7 +872,18 @@ def write_count_matrix(
 
 def main() -> int:
     args = parse_args()
-    output_dir = Path(args.output_dir).expanduser().resolve()
+    
+    # Create outputs folder with timestamp to organize runs
+    base_output_dir = Path(args.output_dir).expanduser().resolve() / "outputs"
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    output_dir = base_output_dir / timestamp
+    
+    # Check if the timestamped directory already exists (should not happen in normal usage)
+    if output_dir.exists():
+        print(f"ERROR: Output directory already exists: {output_dir}", file=sys.stderr)
+        print(f"This is unexpected as timestamps should be unique. Please check for clock issues.", file=sys.stderr)
+        raise FileExistsError(f"Output directory already exists: {output_dir}")
+    
     logger = configure_logging(output_dir)
 
     logger.info("Starting Tahoe-100M pseudobulk generation")
@@ -943,18 +974,37 @@ def main() -> int:
     )
     logger.info("Built %s cell-line AnnData objects", len(cell_line_to_adata))
 
-    group_summary_df.to_csv(output_dir / "group_summary.csv", index=False)
-    count_df.to_csv(output_dir / "cell_line_drug_cell_counts_long.csv", index=False)
-    write_count_matrix(count_df, output_dir, cell_line_order=all_cell_lines, drug_order=all_drugs)
-    coverage_df.to_csv(output_dir / "coverage_report.csv", index=False)
-    cell_line_manifest_df.to_csv(output_dir / "cell_line_collection_manifest.csv", index=False)
+    # Check key output files don't already exist
+    output_dir.mkdir(parents=True, exist_ok=True)
+    check_file_exists_and_fail(output_dir / "group_summary.csv", "group_summary.csv")
+    check_file_exists_and_fail(output_dir / "cell_line_drug_cell_counts_long.csv", "cell_line_drug_cell_counts_long.csv")
+    check_file_exists_and_fail(output_dir / "cell_line_drug_cell_counts.csv", "cell_line_drug_cell_counts.csv")
 
-    with (output_dir / "gene_names.txt").open("w", encoding="utf-8") as handle:
+    group_summary_df.to_csv(output_dir / "group_summary.csv", index=False)
+    logger.info("Wrote group_summary.csv to %s", output_dir / "group_summary.csv")
+    
+    count_df.to_csv(output_dir / "cell_line_drug_cell_counts_long.csv", index=False)
+    logger.info("Wrote cell_line_drug_cell_counts_long.csv to %s", output_dir / "cell_line_drug_cell_counts_long.csv")
+    
+    write_count_matrix(count_df, output_dir, cell_line_order=all_cell_lines, drug_order=all_drugs)
+    logger.info("Wrote cell_line_drug_cell_counts.csv to %s", output_dir / "cell_line_drug_cell_counts.csv")
+    
+    coverage_df.to_csv(output_dir / "coverage_report.csv", index=False)
+    logger.info("Wrote coverage_report.csv to %s", output_dir / "coverage_report.csv")
+    
+    cell_line_manifest_df.to_csv(output_dir / "cell_line_collection_manifest.csv", index=False)
+    logger.info("Wrote cell_line_collection_manifest.csv to %s", output_dir / "cell_line_collection_manifest.csv")
+
+    gene_names_path = output_dir / "gene_names.txt"
+    check_file_exists_and_fail(gene_names_path, "gene_names.txt")
+    with gene_names_path.open("w", encoding="utf-8") as handle:
         for gene_name in gene_names:
             handle.write(f"{gene_name}\n")
+    logger.info("Wrote gene_names.txt to %s", gene_names_path)
 
     if args.save_per_cell_line_h5ad:
         write_cell_line_outputs(cell_line_to_adata, output_dir)
+        logger.info("Wrote per-cell-line h5ad files to %s", output_dir / "cell_line_pseudobulk_h5ad")
 
     if args.save_cell_line_collection_pkl:
         collection_path = write_cell_line_collection_pickle(cell_line_to_adata, output_dir)
@@ -963,6 +1013,7 @@ def main() -> int:
     if args.save_global_h5ad:
         global_adata = build_global_adata(cell_line_to_adata, gene_names)
         global_h5ad_path = output_dir / "all_cell_lines_pseudobulk.h5ad"
+        check_file_exists_and_fail(global_h5ad_path, "all_cell_lines_pseudobulk.h5ad")
         global_adata.write_h5ad(global_h5ad_path)
         logger.info("Wrote global AnnData to %s with shape=%s", global_h5ad_path, global_adata.shape)
 
@@ -973,6 +1024,7 @@ def main() -> int:
     logger.info("Generated %s cell-line/drug groups", len(group_summary_df))
     logger.info("Unique cell lines=%s unique drugs=%s", group_summary_df["cell_line_id"].nunique(), group_summary_df["drug"].nunique())
     logger.info("Coverage: %s observed pairs out of %s possible (%.2f%%)", int(coverage_df.iloc[0]["observed_pairs"]), int(coverage_df.iloc[0]["possible_pairs"]), float(100.0 * coverage_df.iloc[0]["coverage_fraction"]))
+    logger.info("Run timestamp: %s", timestamp)
     logger.info("Wrote outputs to %s", output_dir)
 
     example_cell_line = group_summary_df.iloc[0]["cell_line_id"]
