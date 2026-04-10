@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deep-learning-final-project"
+version = "0.1.0"
+description = "Tahoe-100M pseudobulk and notebook tooling for a deep learning final project"
+requires-python = ">=3.11"
+dependencies = [
+    "anndata",
+    "datasets",
+    "numpy",
+    "pandas",
+    "scipy",
+    "torch",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+notebooks = [
+    "jupyterlab",
+    "pubchempy",
+    "requests",
+    "scanpy",
+]
+
+[project.scripts]
+pseudobulk-tahoe100 = "pseudobulk_tahoe100:main"
+
+[tool.setuptools]
+py-modules = ["pseudobulk_tahoe100"]
+
+[tool.setuptools.package-dir]
+"" = "scripts"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
