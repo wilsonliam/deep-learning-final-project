@@ -52,6 +52,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+DATASET_NAME = "vevotx/Tahoe-100M"
+HF_TOKEN_ENV_VAR = "HF_TOKEN"
+HF_TOKEN_ENV_VAR_LEGACY = "HUGGING_FACE_HUB_TOKEN"
 GROUPBY_OBS_COLUMNS = (
     "drugname_drugconc",
     "sample",
@@ -147,7 +150,54 @@ class BlockAccumulator:
 # Gene vocabulary
 # ---------------------------------------------------------------------------
 
-def build_gene_vocab() -> tuple[np.ndarray, np.ndarray]:
+def _resolve_hf_load_kwargs(
+    hf_cache_dir: Path | None = None,
+) -> tuple[dict[str, str], str | None]:
+    """Build shared ``load_dataset`` kwargs from env auth and optional cache."""
+    token = os.getenv(HF_TOKEN_ENV_VAR)
+    token_source = None
+    if token:
+        token_source = HF_TOKEN_ENV_VAR
+    else:
+        legacy_token = os.getenv(HF_TOKEN_ENV_VAR_LEGACY)
+        if legacy_token:
+            token = legacy_token
+            token_source = HF_TOKEN_ENV_VAR_LEGACY
+            log.warning(
+                "Environment variable %s is deprecated; prefer %s.",
+                HF_TOKEN_ENV_VAR_LEGACY,
+                HF_TOKEN_ENV_VAR,
+            )
+
+    load_kwargs: dict[str, str] = {}
+    if token is not None:
+        load_kwargs["token"] = token
+    if hf_cache_dir is not None:
+        load_kwargs["cache_dir"] = str(hf_cache_dir)
+    return load_kwargs, token_source
+
+
+def _log_hf_startup_config(
+    token_source: str | None,
+    hf_cache_dir: Path | None,
+) -> None:
+    """Emit auth/cache startup logs without exposing secrets."""
+    if token_source is None:
+        log.info(
+            "No Hugging Face env token configured; relying on saved login or anonymous access."
+        )
+    else:
+        log.info("Using Hugging Face env token from %s.", token_source)
+
+    if hf_cache_dir is None:
+        log.info("Using Hugging Face cache dir: library default")
+    else:
+        log.info("Using Hugging Face cache dir: %s", hf_cache_dir)
+
+
+def build_gene_vocab(
+    load_dataset_kwargs: dict[str, str] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """Load Tahoe-100M gene metadata and return ``(gene_ids, token_to_col_array)``.
 
     ``gene_ids``  — 1-D string array of Ensembl IDs, ordered by token_id.
@@ -155,10 +205,16 @@ def build_gene_vocab() -> tuple[np.ndarray, np.ndarray]:
         Maps ``token_id → column index`` for vectorised densification.
         Unmapped positions hold ``-1``.
     """
-    log.info("Loading gene metadata from vevotx/Tahoe-100M ...")
+    load_dataset_kwargs = dict(load_dataset_kwargs or {})
+    t0 = time.monotonic()
+    log.info("Loading gene metadata from %s ...", DATASET_NAME)
     gene_meta = load_dataset(
-        "vevotx/Tahoe-100M", name="gene_metadata", split="train"
+        DATASET_NAME,
+        name="gene_metadata",
+        split="train",
+        **load_dataset_kwargs,
     )
+    log.info("Gene metadata load finished in %.1fs", time.monotonic() - t0)
     df = pd.DataFrame(gene_meta).dropna(subset=["token_id", "ensembl_id"])
     df = df.drop_duplicates(subset="ensembl_id", keep="first")
     df = df.sort_values("token_id").reset_index(drop=True)
@@ -382,6 +438,20 @@ def _iter_ordered_densified_records(
         )
 
 
+def _log_first_record_latency(records, started_at: float, stream_name: str):
+    """Log when the first streamed record arrives to make slow startup visible."""
+    first_record_seen = False
+    for record in records:
+        if not first_record_seen:
+            log.info(
+                "First record received from %s after %.1fs",
+                stream_name,
+                time.monotonic() - started_at,
+            )
+            first_record_seen = True
+        yield record
+
+
 # ---------------------------------------------------------------------------
 # Pseudobulk pipeline
 # ---------------------------------------------------------------------------
@@ -581,6 +651,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional whitelist of cell_line_id values",
     )
     p.add_argument(
+        "--hf-cache-dir",
+        type=Path,
+        default=None,
+        help="Optional Hugging Face cache directory (for example, a scratch disk)",
+    )
+    p.add_argument(
         "--progress-every",
         type=int,
         default=25_000,
@@ -610,13 +686,32 @@ def main(argv: list[str] | None = None) -> None:
         f"--sample-size must be >= 0, got {args.sample_size}"
     )
 
+    hf_load_kwargs, token_source = _resolve_hf_load_kwargs(args.hf_cache_dir)
+    _log_hf_startup_config(token_source, args.hf_cache_dir)
+
     # ---- Gene vocab ----
-    gene_ids, token_to_col = build_gene_vocab()
+    gene_ids, token_to_col = build_gene_vocab(load_dataset_kwargs=hf_load_kwargs)
     n_genes = len(gene_ids)
 
     # ---- Build ordered stream ----
     cell_lines_whitelist = set(args.cell_lines) if args.cell_lines else None
-    raw_records = load_dataset("vevotx/Tahoe-100M", streaming=True, split="train")
+    stream_open_t0 = time.monotonic()
+    log.info("Opening streaming train split from %s ...", DATASET_NAME)
+    raw_records = load_dataset(
+        DATASET_NAME,
+        streaming=True,
+        split="train",
+        **hf_load_kwargs,
+    )
+    log.info(
+        "Streaming train split initialized in %.1fs; waiting for first record ...",
+        time.monotonic() - stream_open_t0,
+    )
+    raw_records = _log_first_record_latency(
+        raw_records,
+        started_at=stream_open_t0,
+        stream_name=f"{DATASET_NAME} train split",
+    )
     ordered_stream = _iter_ordered_densified_records(
         raw_records,
         n_genes=n_genes,
@@ -637,7 +732,7 @@ def main(argv: list[str] | None = None) -> None:
     # ---- Write outputs ----
     run_meta = {
         "block_size": args.block_size,
-        "source_dataset": "vevotx/Tahoe-100M",
+        "source_dataset": DATASET_NAME,
         "sample_size": args.sample_size if args.sample_size is not None else "full",
         "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }

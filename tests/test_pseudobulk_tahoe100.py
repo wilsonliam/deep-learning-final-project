@@ -6,6 +6,7 @@ Run with:  pytest tests/test_pseudobulk_tahoe100.py -v
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -16,13 +17,16 @@ import pytest
 # Make the scripts directory importable.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
+import pseudobulk_tahoe100 as pb
 from pseudobulk_tahoe100 import (
     BlockAccumulator,
     GROUPBY_OBS_COLUMNS,
     OBS_INDEX_NAME,
     PseudobulkGroupKey,
     _densify_record,
+    _log_first_record_latency,
     _iter_ordered_densified_records,
+    main,
     run_pseudobulk,
     write_outputs,
 )
@@ -577,3 +581,102 @@ def test_duplicate_gene_tokens_raises():
     }
     with pytest.raises(ValueError, match="Duplicate gene tokens"):
         _densify_record(record, n_genes, token_to_col)
+
+
+def _install_main_fakes(monkeypatch):
+    """Patch networked entrypoints so ``main`` stays fully offline in tests."""
+    load_calls = []
+
+    def fake_load_dataset(path, *args, **kwargs):
+        load_calls.append((path, kwargs.copy()))
+        if kwargs.get("name") == "gene_metadata":
+            return [
+                {"token_id": 0, "ensembl_id": "ENSG00000"},
+                {"token_id": 1, "ensembl_id": "ENSG00001"},
+            ]
+        return iter(())
+
+    monkeypatch.setattr(pb, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(pb, "run_pseudobulk", lambda *args, **kwargs: {})
+    monkeypatch.setattr(pb, "write_outputs", lambda *args, **kwargs: [])
+    return load_calls
+
+
+def test_main_forwards_hf_token_to_both_dataset_loads(monkeypatch, caplog):
+    """Explicit HF_TOKEN should be forwarded to both remote dataset loads."""
+    load_calls = _install_main_fakes(monkeypatch)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    monkeypatch.setenv("HF_TOKEN", "hf_secret_value")
+    caplog.set_level(logging.INFO, logger=pb.log.name)
+
+    main(["--smoke", "--num-workers", "0"])
+
+    assert len(load_calls) == 2
+    assert [call[0] for call in load_calls] == [pb.DATASET_NAME, pb.DATASET_NAME]
+    assert all(call[1]["token"] == "hf_secret_value" for call in load_calls)
+    assert "Using Hugging Face env token from HF_TOKEN." in caplog.text
+    assert "hf_secret_value" not in caplog.text
+
+
+def test_main_accepts_legacy_hf_token_env_with_warning(monkeypatch, caplog):
+    """Legacy env var still works, but it should warn and prefer the new name."""
+    load_calls = _install_main_fakes(monkeypatch)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setenv("HUGGING_FACE_HUB_TOKEN", "legacy_secret")
+    caplog.set_level(logging.INFO, logger=pb.log.name)
+
+    main(["--smoke", "--num-workers", "0"])
+
+    assert len(load_calls) == 2
+    assert all(call[1]["token"] == "legacy_secret" for call in load_calls)
+    assert "deprecated; prefer HF_TOKEN" in caplog.text
+    assert "Using Hugging Face env token from HUGGING_FACE_HUB_TOKEN." in caplog.text
+    assert "legacy_secret" not in caplog.text
+
+
+def test_main_without_env_token_uses_default_auth_resolution(monkeypatch, caplog):
+    """No env token should keep default Hugging Face auth behavior untouched."""
+    load_calls = _install_main_fakes(monkeypatch)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    caplog.set_level(logging.INFO, logger=pb.log.name)
+
+    main(["--smoke", "--num-workers", "0"])
+
+    assert len(load_calls) == 2
+    assert all("token" not in call[1] for call in load_calls)
+    assert (
+        "No Hugging Face env token configured; relying on saved login or anonymous access."
+        in caplog.text
+    )
+
+
+def test_main_forwards_hf_cache_dir_to_both_dataset_loads(monkeypatch, tmp_path):
+    """CLI cache-dir override should be shared across both dataset loads."""
+    load_calls = _install_main_fakes(monkeypatch)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    cache_dir = tmp_path / "hf_cache"
+
+    main(["--smoke", "--num-workers", "0", "--hf-cache-dir", str(cache_dir)])
+
+    assert len(load_calls) == 2
+    assert all(call[1]["cache_dir"] == str(cache_dir) for call in load_calls)
+
+
+def test_first_record_latency_logs(monkeypatch, caplog):
+    """The stream wrapper should log when the first record arrives."""
+    caplog.set_level(logging.INFO, logger=pb.log.name)
+    times = iter([12.5])
+    monkeypatch.setattr(pb.time, "monotonic", lambda: next(times))
+
+    records = list(
+        _log_first_record_latency(
+            [{"row": 1}, {"row": 2}],
+            started_at=10.0,
+            stream_name="test stream",
+        )
+    )
+
+    assert records == [{"row": 1}, {"row": 2}]
+    assert "First record received from test stream after 2.5s" in caplog.text
