@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ---- user-configurable settings ----
-export HF_TOKEN=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
+export HF_TOKEN=""
 export HF_XET_HIGH_PERFORMANCE=1
 export HF_HUB_ETAG_TIMEOUT=30
 export HF_HUB_DOWNLOAD_TIMEOUT=120
