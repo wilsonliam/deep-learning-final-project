@@ -452,10 +452,10 @@ class CellLineMatrixAccumulator:
 
         self.counts = np.zeros(self.capacity, dtype=np.int32)
 
-        self.fd, self.filename = tempfile.mkstemp(
+        fd, self.filename = tempfile.mkstemp(
             prefix="pseudobulk_matrix_", suffix=".dat"
         )
-        os.close(self.fd)
+        os.close(fd)
         self.sums = np.memmap(
             self.filename,
             dtype=np.float32,
@@ -484,7 +484,7 @@ class CellLineMatrixAccumulator:
         del self.sums
 
         with open(self.filename, "r+b") as f:
-            f.truncate(new_capacity * self.n_genes * 4)  # 4 bytes per float32
+            f.truncate(new_capacity * self.n_genes * np.dtype(np.float32).itemsize)
 
         self.sums = np.memmap(
             self.filename,
@@ -1295,7 +1295,9 @@ def write_cell_line_output(
             "BARCODE_SUB_LIB_ID": [group_key.barcode_sub_lib_id for group_key in group_keys],
             "replicate_id": [group_key.replicate_id for group_key in group_keys],
             "n_cells_total": valid_counts.tolist(),
+            # n_complete_blocks is informational; the actual math uses all cells.
             "n_complete_blocks": (valid_counts // block_size).tolist(),
+            # All cells are used in the new accumulation math (no remainder dropped).
             "n_cells_used": valid_counts.tolist(),
             "n_cells_dropped": [0] * len(group_keys),
         },
