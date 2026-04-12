@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/Users/liamwilson/deep-learning-final-project/scripts/pseudobulk_tahoe100.py", line 42, in <module>
+    import anndata as ad
+ModuleNotFoundError: No module named 'anndata'
