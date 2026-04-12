@@ -80,7 +80,7 @@ REQUIRED_SAMPLE_METADATA_COLUMNS = (
     "plate",
     "drugname_drugconc",
 )
-REQUIRED_CELL_LINE_METADATA_COLUMNS = ("cell_line_id",)
+REQUIRED_CELL_LINE_METADATA_COLUMNS = ("Cell_ID_Cellosaur",)
 REQUIRED_EXPRESSION_STREAM_COLUMNS = (
     "cell_line_id",
     "drug",
@@ -737,7 +737,7 @@ def build_target_cell_line_ids(cell_line_metadata_rows) -> list[str]:
             f"{missing_columns}. Available columns: {sorted(df.columns.tolist())}"
         )
 
-    return _normalize_cell_line_ids(df["cell_line_id"].tolist())
+    return _normalize_cell_line_ids(df["Cell_ID_Cellosaur"].tolist())
 
 
 def load_target_cell_line_ids(

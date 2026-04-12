@@ -405,17 +405,17 @@ def test_build_target_cell_line_ids_normalizes_and_sorts():
     """Cell-line metadata should normalize whitespace and return sorted unique ids."""
     assert build_target_cell_line_ids(
         [
-            {"cell_line_id": " CL_B "},
-            {"cell_line_id": "CL_A"},
-            {"cell_line_id": "CL_B"},
+            {"Cell_ID_Cellosaur": " CVCL_0002 "},
+            {"Cell_ID_Cellosaur": "CVCL_0001"},
+            {"Cell_ID_Cellosaur": "CVCL_0002"},
         ]
-    ) == ["CL_A", "CL_B"]
+    ) == ["CVCL_0001", "CVCL_0002"]
 
 
 def test_build_target_cell_line_ids_requires_non_empty_values():
     """Empty cell_line_id metadata should fail fast."""
     with pytest.raises(RuntimeError, match="cell_line_id values must be non-empty"):
-        build_target_cell_line_ids([{"cell_line_id": " "}])
+        build_target_cell_line_ids([{"Cell_ID_Cellosaur": " "}])
 
 
 def test_normalize_record_with_sample_metadata_enriches_row():
@@ -1048,7 +1048,7 @@ def _install_main_fakes(
     )
     cell_line_metadata_rows = list(
         cell_line_metadata_rows
-        or [{"cell_line_id": " CL_B "}, {"cell_line_id": "CL_A"}]
+        or [{"Cell_ID_Cellosaur": " CL_B "}, {"Cell_ID_Cellosaur": "CL_A"}]
     )
 
     def fake_load_dataset(path, *args, **kwargs):
