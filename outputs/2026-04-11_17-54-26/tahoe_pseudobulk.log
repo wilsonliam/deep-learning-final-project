@@ -1,0 +1,3 @@
+2026-04-11 17:54:26,924 INFO tahoe_pseudobulk: Starting Tahoe-100M pseudobulk generation
+2026-04-11 17:54:26,926 INFO tahoe_pseudobulk: Dataset=tahoebio/Tahoe-100M split=train workers=8 batch_size=512 sample_size=None test_run=True
+2026-04-11 17:54:26,927 INFO tahoe_pseudobulk: SLURM job id=n/a node=n/a

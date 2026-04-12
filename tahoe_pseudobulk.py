@@ -35,12 +35,13 @@ from datasets import load_dataset
 from scipy import sparse
 
 
-DEFAULT_DATASET_NAME = "vevotx/Tahoe-100M"
+DEFAULT_DATASET_NAME = "tahoebio/Tahoe-100M"
 DEFAULT_BATCH_SIZE = 512
 DEFAULT_REPORT_EVERY = 25_000
 DEFAULT_LOOKUP_BATCH_SIZE = 500
 DEFAULT_LOOKUP_PAUSE_SECONDS = 0.05
 DEFAULT_LOOKUP_TIMEOUT_SECONDS = 30
+DEFAULT_EXPRESSION_DATA_NAME = "expression_data"
 UNTREATED_LABELS = {"untreated", "control", "vehicle", "dmso"}
 
 
@@ -62,6 +63,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-name", default=DEFAULT_DATASET_NAME)
     parser.add_argument("--split", default="train")
     parser.add_argument("--output-dir", required=True, help="Directory for outputs.")
+    parser.add_argument(
+        "--expression-data-name",
+        default=DEFAULT_EXPRESSION_DATA_NAME,
+        help="Dataset config name containing the main expression records.",
+    )
     parser.add_argument(
         "--num-workers",
         type=int,
@@ -111,6 +117,17 @@ def parse_args() -> argparse.Namespace:
         "--skip-ensembl-lookup",
         action="store_true",
         help="Skip external Ensembl lookup and keep the raw gene metadata vocabulary.",
+    )
+    parser.add_argument(
+        "--protein-coding-only",
+        action="store_true",
+        help="Restrict the gene vocabulary to genes annotated as protein_coding.",
+    )
+    parser.add_argument(
+        "--treatment-column",
+        choices=["drug", "drugname_drugconc", "sample"],
+        default="drug",
+        help="Metadata field used to define unique treatment groups within each cell line.",
     )
     parser.add_argument(
         "--no-filter-nonzero",
@@ -220,7 +237,12 @@ def fetch_ensembl_biotypes(
     return biotype_by_id, failed_batches
 
 
-def build_filtered_gene_vocab(gene_metadata: pd.DataFrame, *, skip_lookup: bool = False) -> tuple[dict[int, str], dict[str, int]]:
+def build_filtered_gene_vocab(
+    gene_metadata: pd.DataFrame,
+    *,
+    skip_lookup: bool = False,
+    protein_coding_only: bool = False,
+) -> tuple[dict[int, str], dict[str, int]]:
     required_columns = {"token_id", "ensembl_id"}
     missing_columns = required_columns - set(gene_metadata.columns)
     if missing_columns:
@@ -234,7 +256,22 @@ def build_filtered_gene_vocab(gene_metadata: pd.DataFrame, *, skip_lookup: bool 
 
     gene_df["ensembl_core"] = gene_df["ensembl_id"].astype(str).str.split(".").str[0]
 
-    if skip_lookup:
+    local_biotype_col = next(
+        (column for column in ("biotype", "gene_biotype") if column in gene_metadata.columns),
+        None,
+    )
+    if local_biotype_col is not None:
+        biotype_lookup = (
+            gene_metadata.loc[:, ["ensembl_id", local_biotype_col]]
+            .dropna(subset=["ensembl_id"])
+            .assign(ensembl_core=lambda df: df["ensembl_id"].astype(str).str.split(".").str[0])
+            .drop_duplicates(subset="ensembl_core", keep="first")
+        )
+        gene_df["biotype"] = gene_df["ensembl_core"].map(
+            dict(zip(biotype_lookup["ensembl_core"], biotype_lookup[local_biotype_col]))
+        )
+        failed_batches = 0
+    elif skip_lookup:
         gene_df["biotype"] = None
         failed_batches = 0
     else:
@@ -242,20 +279,27 @@ def build_filtered_gene_vocab(gene_metadata: pd.DataFrame, *, skip_lookup: bool 
         gene_df["biotype"] = gene_df["ensembl_core"].map(biotype_by_id)
 
     resolved_biotypes = int(gene_df["biotype"].notna().sum())
-    if not skip_lookup and resolved_biotypes == 0:
+    if (protein_coding_only or not skip_lookup) and resolved_biotypes == 0:
         raise RuntimeError(
-            "External Ensembl lookup returned no biotype annotations. "
-            "Cannot remove pseudogenes without external annotation."
+            "No gene biotype annotations are available. "
+            "Cannot apply the requested gene-biotype filtering."
         )
 
-    if skip_lookup:
+    if protein_coding_only:
+        keep_mask = gene_df["biotype"].fillna("").eq("protein_coding")
+        filtered_out_genes = int((~keep_mask).sum())
+        gene_df = gene_df.loc[keep_mask].copy()
+        filter_mode = "protein_coding_only"
+    elif skip_lookup and local_biotype_col is None:
         pseudogene_mask = pd.Series(False, index=gene_df.index)
+        filtered_out_genes = 0
+        filter_mode = "none"
     else:
         pseudogene_mask = gene_df["biotype"].fillna("").str.contains("pseudogene", case=False)
-
-    pseudogenes_removed = int(pseudogene_mask.sum())
-    gene_df = gene_df.loc[~pseudogene_mask].copy()
-    after_pseudogene_genes = int(len(gene_df))
+        filtered_out_genes = int(pseudogene_mask.sum())
+        gene_df = gene_df.loc[~pseudogene_mask].copy()
+        filter_mode = "drop_pseudogenes"
+    after_gene_filter = int(len(gene_df))
 
     duplicated_token_ids = int(gene_df["token_id"].duplicated().sum())
     if duplicated_token_ids:
@@ -266,8 +310,9 @@ def build_filtered_gene_vocab(gene_metadata: pd.DataFrame, *, skip_lookup: bool 
     stats = {
         "initial_genes": initial_genes,
         "after_dedup_genes": after_dedup_genes,
-        "pseudogenes_removed": pseudogenes_removed,
-        "after_pseudogene_genes": after_pseudogene_genes,
+        "gene_filter_mode": filter_mode,
+        "filtered_out_genes": filtered_out_genes,
+        "after_gene_filter_genes": after_gene_filter,
         "resolved_biotypes": resolved_biotypes,
         "unresolved_biotypes": int(after_dedup_genes - resolved_biotypes),
         "failed_lookup_batches": failed_batches,
@@ -303,17 +348,49 @@ def sort_drugs_with_untreated_first(drugs: Iterable[str]) -> list[str]:
     return unique_drugs
 
 
+def normalize_group_label(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and np.isnan(value):
+        return ""
+    return str(value).strip()
+
+
+def resolve_treatment_label(
+    record: dict,
+    *,
+    treatment_column: str,
+    sample_to_treatment: dict[str, str],
+) -> str:
+    if treatment_column == "drug":
+        return canonicalize_drug_label(record["drug"])
+    if treatment_column == "sample":
+        return normalize_group_label(record["sample"])
+
+    sample = normalize_group_label(record["sample"])
+    treatment = sample_to_treatment.get(sample, "")
+    if treatment:
+        return treatment
+    return canonicalize_drug_label(record["drug"])
+
+
 def aggregate_record_batch(
     batch: list[dict],
     token_id_to_col_idx: dict[int, int],
     n_genes: int,
-    allowed_drugs: set[str] | None,
+    allowed_treatments: set[str] | None,
+    treatment_column: str,
+    sample_to_treatment: dict[str, str],
 ) -> dict[str, PseudobulkGroup]:
     partial_groups: dict[str, PseudobulkGroup] = {}
 
     for record in batch:
-        drug = canonicalize_drug_label(record["drug"])
-        if allowed_drugs is not None and drug not in allowed_drugs:
+        treatment = resolve_treatment_label(
+            record,
+            treatment_column=treatment_column,
+            sample_to_treatment=sample_to_treatment,
+        )
+        if allowed_treatments is not None and treatment not in allowed_treatments:
             continue
 
         genes = record["genes"]
@@ -323,7 +400,7 @@ def aggregate_record_batch(
             genes = genes[1:]
             expressions = expressions[1:]
 
-        group_key = f"{record['cell_line_id']}\t{drug}"
+        group_key = f"{record['cell_line_id']}\t{treatment}"
         group = partial_groups.get(group_key)
         if group is None:
             group = PseudobulkGroup(
@@ -366,7 +443,9 @@ def build_pseudobulk_index(
     sample_size: int | None,
     report_every: int,
     logger: logging.Logger,
-    allowed_drugs: set[str] | None = None,
+    allowed_treatments: set[str] | None = None,
+    treatment_column: str = "drug",
+    sample_to_treatment: dict[str, str] | None = None,
     max_groups: int | None = None,
     checkpoint_every_merges: int = 25,
     checkpoint_callback: Callable[[DefaultDict[str, PseudobulkGroup], int], None] | None = None,
@@ -389,7 +468,9 @@ def build_pseudobulk_index(
             batch_records,
             token_id_to_col_idx,
             len(gene_names),
-            allowed_drugs,
+            allowed_treatments,
+            treatment_column,
+            sample_to_treatment or {},
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
@@ -576,17 +657,30 @@ def count_cells_matrix(data_by_cell_and_drug: dict[str, dict[str, PseudobulkGrou
 def build_coverage_report(
     sample_metadata: pd.DataFrame,
     count_df: pd.DataFrame,
+    *,
+    treatment_column: str,
 ) -> pd.DataFrame:
     observed_cell_lines = int(count_df["cell_line_id"].nunique()) if not count_df.empty else 0
     observed_drugs = int(count_df["drug"].nunique()) if not count_df.empty else 0
     observed_pairs = int(len(count_df))
 
     metadata_cell_lines = int(sample_metadata["cell_line_id"].astype(str).nunique()) if "cell_line_id" in sample_metadata.columns else observed_cell_lines
-    metadata_drugs = (
-        int(sample_metadata["drug"].map(canonicalize_drug_label).nunique())
-        if "drug" in sample_metadata.columns
-        else observed_drugs
-    )
+    if treatment_column == "drug":
+        metadata_drugs = (
+            int(sample_metadata["drug"].map(canonicalize_drug_label).nunique())
+            if "drug" in sample_metadata.columns
+            else observed_drugs
+        )
+    elif treatment_column in sample_metadata.columns:
+        metadata_drugs = int(
+            sample_metadata[treatment_column]
+            .map(normalize_group_label)
+            .replace("", np.nan)
+            .dropna()
+            .nunique()
+        )
+    else:
+        metadata_drugs = observed_drugs
 
     possible_pairs = int(metadata_cell_lines * metadata_drugs)
     coverage_fraction = float(observed_pairs / possible_pairs) if possible_pairs else 0.0
@@ -623,22 +717,69 @@ def pseudobulk_df_for_pair(
 
 
 def build_treatment_subset(sample_metadata: pd.DataFrame, test_run: bool, test_run_treatments: int) -> set[str]:
-    if "drug" not in sample_metadata.columns:
-        raise ValueError("Sample metadata is missing the 'drug' column.")
+    return build_treatment_subset_for_column(
+        sample_metadata,
+        test_run=test_run,
+        test_run_treatments=test_run_treatments,
+        treatment_column="drug",
+    )
 
-    all_perturbations = sort_drugs_with_untreated_first(sample_metadata["drug"].dropna().tolist())
+
+def build_treatment_subset_for_column(
+    sample_metadata: pd.DataFrame,
+    *,
+    test_run: bool,
+    test_run_treatments: int,
+    treatment_column: str,
+) -> set[str]:
+    if treatment_column not in sample_metadata.columns:
+        raise ValueError(f"Sample metadata is missing the '{treatment_column}' column.")
+
+    if treatment_column == "drug":
+        all_perturbations = sort_drugs_with_untreated_first(sample_metadata["drug"].dropna().tolist())
+    else:
+        all_perturbations = sorted(
+            {
+                normalize_group_label(value)
+                for value in sample_metadata[treatment_column].dropna().tolist()
+                if normalize_group_label(value)
+            }
+        )
     if not test_run:
         return set(all_perturbations)
 
     rng = np.random.default_rng(42)
-    fixed = [drug for drug in all_perturbations if drug == "Untreated"]
-    variable = np.array([drug for drug in all_perturbations if drug != "Untreated"], dtype=object)
+    fixed = [label for label in all_perturbations if label == "Untreated"]
+    variable = np.array([label for label in all_perturbations if label != "Untreated"], dtype=object)
     rng.shuffle(variable)
 
     selected = fixed[:]
     remaining_slots = max(test_run_treatments - len(selected), 0)
     selected.extend(variable[:remaining_slots].tolist())
     return set(selected)
+
+
+def build_sample_to_treatment_map(sample_metadata: pd.DataFrame, *, treatment_column: str) -> dict[str, str]:
+    if treatment_column == "drug":
+        return {}
+    if treatment_column == "sample":
+        if "sample" not in sample_metadata.columns:
+            raise ValueError("Sample metadata is missing the 'sample' column.")
+        return {
+            normalize_group_label(sample): normalize_group_label(sample)
+            for sample in sample_metadata["sample"].dropna().tolist()
+            if normalize_group_label(sample)
+        }
+    if "sample" not in sample_metadata.columns or treatment_column not in sample_metadata.columns:
+        raise ValueError(
+            f"Sample metadata must contain both 'sample' and '{treatment_column}' to group by {treatment_column}."
+        )
+    sample_df = sample_metadata.loc[:, ["sample", treatment_column]].dropna(subset=["sample"]).copy()
+    return {
+        normalize_group_label(sample): normalize_group_label(value)
+        for sample, value in zip(sample_df["sample"], sample_df[treatment_column])
+        if normalize_group_label(sample) and normalize_group_label(value)
+    }
 
 
 def build_cell_line_adata_collection(
@@ -825,6 +966,10 @@ def write_progress_checkpoints(
         fill_value=0,
         aggfunc="sum",
     ) if not count_df.empty else pd.DataFrame()
+    if not cell_line_order:
+        cell_line_order = sorted(count_df["cell_line_id"].dropna().astype(str).unique().tolist()) if not count_df.empty else []
+    if not drug_order:
+        drug_order = sorted(count_df["drug"].dropna().astype(str).unique().tolist()) if not count_df.empty else []
     matrix = matrix.reindex(index=cell_line_order, fill_value=0)
     matrix = matrix.reindex(columns=drug_order, fill_value=0)
     atomic_write_csv(
@@ -901,19 +1046,31 @@ def main() -> int:
     gene_vocab, gene_filter_stats = build_filtered_gene_vocab(
         gene_metadata_df,
         skip_lookup=args.skip_ensembl_lookup,
+        protein_coding_only=args.protein_coding_only,
     )
     logger.info("Gene vocab stats: %s", gene_filter_stats)
 
     sample_metadata_df = sample_metadata.to_pandas() if hasattr(sample_metadata, "to_pandas") else pd.DataFrame(sample_metadata)
 
-    treatment_subset = build_treatment_subset(
+    treatment_subset = build_treatment_subset_for_column(
         sample_metadata_df,
-        args.test_run,
-        args.test_run_treatments,
+        test_run=args.test_run,
+        test_run_treatments=args.test_run_treatments,
+        treatment_column=args.treatment_column,
     )
-    logger.info("Selected %s treatments", len(treatment_subset))
+    logger.info("Selected %s treatment groups using column=%s", len(treatment_subset), args.treatment_column)
 
-    streaming_ds = load_dataset(args.dataset_name, streaming=True, split=args.split)
+    sample_to_treatment = build_sample_to_treatment_map(
+        sample_metadata_df,
+        treatment_column=args.treatment_column,
+    )
+
+    streaming_ds = load_dataset(
+        args.dataset_name,
+        name=args.expression_data_name,
+        streaming=True,
+        split=args.split,
+    )
 
     all_cell_lines = (
         sorted(sample_metadata_df["cell_line_id"].dropna().astype(str).unique().tolist())
@@ -922,8 +1079,8 @@ def main() -> int:
     )
     all_drugs = (
         sort_drugs_with_untreated_first(sample_metadata_df["drug"].dropna().tolist())
-        if "drug" in sample_metadata_df.columns
-        else sort_drugs_with_untreated_first(treatment_subset)
+        if args.treatment_column == "drug" and "drug" in sample_metadata_df.columns
+        else sorted(treatment_subset)
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -945,7 +1102,9 @@ def main() -> int:
         sample_size=args.sample_size,
         report_every=max(1, args.report_every),
         logger=logger,
-        allowed_drugs=treatment_subset,
+        allowed_treatments=treatment_subset,
+        treatment_column=args.treatment_column,
+        sample_to_treatment=sample_to_treatment,
         max_groups=args.max_groups,
         checkpoint_every_merges=max(1, args.checkpoint_every_merges),
         checkpoint_callback=checkpoint_callback,
@@ -959,7 +1118,11 @@ def main() -> int:
 
     group_summary_df = summarize_groups(data_by_cell_and_drug)
     count_df = count_cells_matrix(data_by_cell_and_drug)
-    coverage_df = build_coverage_report(sample_metadata_df, count_df)
+    coverage_df = build_coverage_report(
+        sample_metadata_df,
+        count_df,
+        treatment_column=args.treatment_column,
+    )
 
     if not all_cell_lines:
         all_cell_lines = sorted(group_summary_df["cell_line_id"].dropna().astype(str).unique().tolist())
