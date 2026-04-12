@@ -535,7 +535,7 @@ def _stringify_scalar_value(value) -> str:
         return ""
     if isinstance(value, (float, np.floating)) and np.isnan(value):
         return ""
-    return str(value)
+    return str(value).strip()
 
 
 def _validate_expression_stream_columns(
@@ -872,6 +872,7 @@ def _normalize_record_with_sample_metadata(
             f"plate {sample_meta.plate!r} for sample {sample!r}."
         )
 
+    record["sample"] = sample_meta.sample
     record["drug"] = sample_meta.drug
     record["plate"] = sample_meta.plate
     record["drugname_drugconc"] = sample_meta.drugname_drugconc

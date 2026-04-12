@@ -354,6 +354,25 @@ def test_build_sample_metadata_lookup_accepts_unique_samples():
     assert lookup["S1"].drugname_drugconc == "DrugA_1uM"
 
 
+def test_build_sample_metadata_lookup_strips_whitespace():
+    """Sample metadata should normalize leading/trailing whitespace."""
+    lookup = pb.build_sample_metadata_lookup(
+        [
+            {
+                "sample": " S1 ",
+                "drug": " DrugA ",
+                "plate": " P1 ",
+                "drugname_drugconc": " DrugA_1uM ",
+            }
+        ]
+    )
+
+    assert list(lookup) == ["S1"]
+    assert lookup["S1"].drug == "DrugA"
+    assert lookup["S1"].plate == "P1"
+    assert lookup["S1"].drugname_drugconc == "DrugA_1uM"
+
+
 def test_build_sample_metadata_lookup_rejects_duplicate_samples():
     """Duplicate sample keys must fail fast."""
     with pytest.raises(RuntimeError, match="duplicate sample keys"):
@@ -392,6 +411,34 @@ def test_normalize_record_with_sample_metadata_enriches_row():
     assert normalized["drug"] == "DrugA"
     assert normalized["plate"] == "P1"
     assert normalized["drugname_drugconc"] == "DrugA_1uM"
+
+
+def test_normalize_record_with_sample_metadata_ignores_trailing_whitespace():
+    """Stream/sample metadata comparisons should tolerate surrounding whitespace."""
+    lookup = pb.build_sample_metadata_lookup(
+        [
+            {
+                "sample": "S1",
+                "drug": "selinexor ",
+                "plate": "P1 ",
+                "drugname_drugconc": " selinexor_1uM ",
+            }
+        ]
+    )
+    record = _raw_record(
+        "CL1",
+        " selinexor",
+        np.array([1.0], dtype=np.float32),
+        sample=" S1 ",
+        plate="P1",
+    )
+
+    normalized = pb._normalize_record_with_sample_metadata(record, lookup)
+
+    assert normalized["sample"] == "S1"
+    assert normalized["drug"] == "selinexor"
+    assert normalized["plate"] == "P1"
+    assert normalized["drugname_drugconc"] == "selinexor_1uM"
 
 
 def test_normalize_record_with_sample_metadata_requires_known_sample():
