@@ -18,10 +18,10 @@ the same cell order as a serial run.
 
 Memory
 ------
-Accumulator memory ≈ 2 × n_groups × n_genes × 4 bytes (~500 KB per group).
-At ``--sample-size 200000`` the working set is well under 2 GB.  A full 100M
-run would likely cross 25 GB — a per-cell-line re-streaming refactor would
-be needed for that.
+Accumulator memory scales with the number of replicate-aware groups that are
+resident at once. This CLI now streams one cell line at a time so the working
+set stays bounded by a single cell line's active groups rather than the full
+dataset.
 
 Dependencies: datasets, anndata, numpy, pandas, torch, scipy, tqdm
 """
@@ -29,6 +29,7 @@ Dependencies: datasets, anndata, numpy, pandas, torch, scipy, tqdm
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import math
 import multiprocessing as mp
@@ -79,6 +80,7 @@ REQUIRED_SAMPLE_METADATA_COLUMNS = (
     "plate",
     "drugname_drugconc",
 )
+REQUIRED_CELL_LINE_METADATA_COLUMNS = ("cell_line_id",)
 REQUIRED_EXPRESSION_STREAM_COLUMNS = (
     "cell_line_id",
     "drug",
@@ -88,7 +90,6 @@ REQUIRED_EXPRESSION_STREAM_COLUMNS = (
     "genes",
     "expressions",
 )
-TAHOE_ESTIMATED_TOTAL_CELLS = 100_000_000
 PROGRESS_BAR_REFRESH_SECONDS = 1.0
 PROGRESS_PHASE_LABEL = "Phase 4/4: streaming accumulation"
 
@@ -126,6 +127,19 @@ class SampleMetadataEntry:
     drug: str
     plate: str
     drugname_drugconc: str
+
+
+@dataclass(frozen=True)
+class AccumulatorSummary:
+    """Aggregate counts for one set of replicate-aware accumulators."""
+
+    total_cells_processed: int
+    total_cells_used: int
+    total_cells_dropped: int
+    total_groups: int
+    groups_with_blocks: int
+    groups_without_blocks: int
+    shortfalls: tuple[tuple[int, str, str, str, str, str], ...] = ()
 
 
 _TQDM_FACTORY = _tqdm
@@ -216,17 +230,16 @@ def _stderr_supports_live_progress(stream=None) -> bool:
 
 
 def _resolve_progress_total_cells(
-    sample_size: int | None,
+    *,
+    remaining_sample_size: int | None,
     progress_total_cells: int | None,
-    cell_lines_whitelist: set[str] | None,
+    target_cell_line_count: int,
 ) -> tuple[int | None, bool]:
-    """Choose the total used for percent/ETA math."""
-    if sample_size is not None:
-        return sample_size, False
-    if progress_total_cells is not None:
+    """Choose the per-cell-line total used for percent/ETA math."""
+    if remaining_sample_size is not None:
+        return remaining_sample_size, False
+    if target_cell_line_count == 1 and progress_total_cells is not None:
         return progress_total_cells, False
-    if cell_lines_whitelist is None:
-        return TAHOE_ESTIMATED_TOTAL_CELLS, True
     return None, False
 
 
@@ -701,6 +714,54 @@ def load_sample_metadata_lookup(
     return lookup
 
 
+def _normalize_cell_line_ids(values) -> list[str]:
+    """Normalize, validate, de-duplicate, and sort cell line identifiers."""
+    normalized = [_stringify_scalar_value(value) for value in values]
+    if any(value == "" for value in normalized):
+        raise RuntimeError("cell_line_id values must be non-empty after normalization.")
+    unique_ids = sorted(set(normalized))
+    if not unique_ids:
+        raise RuntimeError("No usable cell_line_id values were found.")
+    return unique_ids
+
+
+def build_target_cell_line_ids(cell_line_metadata_rows) -> list[str]:
+    """Validate Tahoe cell-line metadata rows and return sorted target ids."""
+    df = pd.DataFrame(cell_line_metadata_rows)
+    missing_columns = sorted(
+        set(REQUIRED_CELL_LINE_METADATA_COLUMNS) - set(df.columns)
+    )
+    if missing_columns:
+        raise RuntimeError(
+            "cell_line_metadata schema is incompatible: missing required columns "
+            f"{missing_columns}. Available columns: {sorted(df.columns.tolist())}"
+        )
+
+    return _normalize_cell_line_ids(df["cell_line_id"].tolist())
+
+
+def load_target_cell_line_ids(
+    load_dataset_kwargs: dict[str, object] | None = None,
+) -> list[str]:
+    """Load Tahoe cell_line_metadata and return sorted unique target ids."""
+    load_dataset_kwargs = dict(load_dataset_kwargs or {})
+    t0 = time.monotonic()
+    log.info("Loading cell line metadata from %s ...", DATASET_NAME)
+    cell_line_metadata = load_dataset(
+        DATASET_NAME,
+        name="cell_line_metadata",
+        split="train",
+        **load_dataset_kwargs,
+    )
+    cell_line_ids = build_target_cell_line_ids(cell_line_metadata)
+    log.info(
+        "Cell line metadata load finished in %.1fs (%d cell lines)",
+        time.monotonic() - t0,
+        len(cell_line_ids),
+    )
+    return cell_line_ids
+
+
 def build_gene_vocab(
     load_dataset_kwargs: dict[str, object] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -1068,35 +1129,18 @@ def run_pseudobulk(
     return accumulators
 
 
-def write_outputs(
+def _summarize_accumulators(
     accumulators: dict[PseudobulkGroupKey, BlockAccumulator],
-    gene_ids: np.ndarray,
-    output_dir: Path,
-    run_meta: dict,
-) -> list[Path]:
-    """Write per-cell-line .h5ad files.  Returns list of paths written."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    n_genes = len(gene_ids)
-
-    # Group by cell line.
-    by_cell_line: dict[str, list[tuple[PseudobulkGroupKey, BlockAccumulator]]] = {}
-    n_excluded_total = 0
-    for group_key, acc in accumulators.items():
-        if acc.n_complete_blocks == 0:
-            n_excluded_total += 1
-            continue
-        by_cell_line.setdefault(group_key.cell_line_id, []).append((group_key, acc))
-
-    if not by_cell_line:
-        raise RuntimeError(
-            "No replicate-aware groups had enough cells for even one complete "
-            f"block of size {run_meta.get('block_size', '?')}. "
-            f"Total groups seen: {len(accumulators)}, all excluded."
-        )
-
-    if n_excluded_total > 0:
-        # Report the most under-represented groups.
-        shortfalls = sorted(
+) -> AccumulatorSummary:
+    """Compute aggregate counts and exclusion details for one accumulator set."""
+    total_cells_processed = sum(acc.n_cells_seen for acc in accumulators.values())
+    total_cells_used = sum(acc.n_cells_used for acc in accumulators.values())
+    total_cells_dropped = sum(acc.n_cells_dropped for acc in accumulators.values())
+    groups_with_blocks = sum(
+        1 for acc in accumulators.values() if acc.n_complete_blocks > 0
+    )
+    shortfalls = tuple(
+        sorted(
             (
                 (
                     acc.n_cells_seen,
@@ -1111,60 +1155,168 @@ def write_outputs(
             ),
             reverse=True,
         )
+    )
+    return AccumulatorSummary(
+        total_cells_processed=total_cells_processed,
+        total_cells_used=total_cells_used,
+        total_cells_dropped=total_cells_dropped,
+        total_groups=len(accumulators),
+        groups_with_blocks=groups_with_blocks,
+        groups_without_blocks=len(accumulators) - groups_with_blocks,
+        shortfalls=shortfalls,
+    )
+
+
+def _cell_line_output_path(output_dir: Path, cell_line_id: str) -> Path:
+    """Return the final output path for one cell line."""
+    return output_dir / f"{cell_line_id}.h5ad"
+
+
+def write_cell_line_output(
+    cell_line_id: str,
+    accumulators: dict[PseudobulkGroupKey, BlockAccumulator],
+    gene_ids: np.ndarray,
+    output_dir: Path,
+    run_meta: dict,
+) -> Path | None:
+    """Write a single cell line atomically, or return ``None`` when empty/sparse."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    n_genes = len(gene_ids)
+    summary = _summarize_accumulators(accumulators)
+
+    if summary.groups_with_blocks == 0:
+        if summary.groups_without_blocks > 0:
+            log.warning(
+                "Cell line %s skipped: %d replicate-aware groups excluded (< %d cells). "
+                "Top shortfalls: %s",
+                cell_line_id,
+                summary.groups_without_blocks,
+                run_meta.get("block_size", "?"),
+                summary.shortfalls[:10],
+            )
+        else:
+            log.warning(
+                "Cell line %s skipped: no expression rows produced any replicate-aware groups.",
+                cell_line_id,
+            )
+        return None
+
+    if summary.groups_without_blocks > 0:
         log.warning(
-            "%d replicate-aware groups excluded (< %d cells). "
+            "Cell line %s excluded %d replicate-aware groups (< %d cells). "
             "Top shortfalls: %s",
-            n_excluded_total,
+            cell_line_id,
+            summary.groups_without_blocks,
             run_meta.get("block_size", "?"),
-            shortfalls[:10],
+            summary.shortfalls[:10],
+        )
+
+    pairs = sorted(
+        (
+            (group_key, acc)
+            for group_key, acc in accumulators.items()
+            if group_key.cell_line_id == cell_line_id and acc.n_complete_blocks > 0
+        ),
+        key=lambda pair: pair[0],
+    )
+    if not pairs:
+        raise RuntimeError(
+            f"Expected replicate-aware groups for cell line {cell_line_id}, but none were retained."
+        )
+
+    group_keys = [group_key for group_key, _ in pairs]
+    accs = [acc for _, acc in pairs]
+    X = np.stack([acc.finalize() for acc in accs], axis=0)
+    assert X.shape == (len(group_keys), n_genes), (
+        f"Shape mismatch for {cell_line_id}: {X.shape} vs "
+        f"({len(group_keys)}, {n_genes})"
+    )
+    assert np.all(np.isfinite(X)), f"Non-finite values in pseudobulk for {cell_line_id}"
+
+    obs = pd.DataFrame(
+        {
+            "drug": [group_key.drug for group_key in group_keys],
+            "drugname_drugconc": [group_key.drug_key for group_key in group_keys],
+            "sample": [group_key.sample for group_key in group_keys],
+            "plate": [group_key.plate for group_key in group_keys],
+            "BARCODE_SUB_LIB_ID": [group_key.barcode_sub_lib_id for group_key in group_keys],
+            "replicate_id": [group_key.replicate_id for group_key in group_keys],
+            "n_cells_total": [acc.n_cells_seen for acc in accs],
+            "n_complete_blocks": [acc.n_complete_blocks for acc in accs],
+            "n_cells_used": [acc.n_cells_used for acc in accs],
+            "n_cells_dropped": [acc.n_cells_dropped for acc in accs],
+        },
+        index=pd.Index([group_key.obs_index for group_key in group_keys], name=OBS_INDEX_NAME),
+    )
+    var = pd.DataFrame(index=pd.Index(gene_ids, name="ensembl_id"))
+
+    adata = ad.AnnData(X=X, obs=obs, var=var)
+    adata.uns["cell_line_id"] = cell_line_id
+    adata.uns["pseudobulk_groupby_columns"] = list(GROUPBY_OBS_COLUMNS)
+    for key, value in run_meta.items():
+        adata.uns[key] = value
+
+    final_path = _cell_line_output_path(output_dir, cell_line_id)
+    file_descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{cell_line_id}.",
+        suffix=".h5ad",
+        dir=output_dir,
+    )
+    os.close(file_descriptor)
+    temp_path = Path(temp_name)
+    try:
+        adata.write_h5ad(temp_path)
+        os.replace(temp_path, final_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+    log.info(
+        "Wrote %s  — shape %s (%d replicate-aware groups × %d genes)",
+        final_path,
+        X.shape,
+        X.shape[0],
+        X.shape[1],
+    )
+    return final_path
+
+
+def write_outputs(
+    accumulators: dict[PseudobulkGroupKey, BlockAccumulator],
+    gene_ids: np.ndarray,
+    output_dir: Path,
+    run_meta: dict,
+) -> list[Path]:
+    """Write per-cell-line .h5ad files.  Returns list of paths written."""
+    by_cell_line: dict[str, list[tuple[PseudobulkGroupKey, BlockAccumulator]]] = {}
+    for group_key, acc in accumulators.items():
+        by_cell_line.setdefault(group_key.cell_line_id, []).append((group_key, acc))
+
+    if not by_cell_line:
+        raise RuntimeError(
+            "No replicate-aware groups had enough cells for even one complete "
+            f"block of size {run_meta.get('block_size', '?')}. "
+            f"Total groups seen: {len(accumulators)}, all excluded."
         )
 
     written: list[Path] = []
     for cell_line_id, pairs in sorted(by_cell_line.items()):
-        pairs.sort(key=lambda t: t[0])
-        group_keys = [group_key for group_key, _ in pairs]
-        accs = [a for _, a in pairs]
-
-        X = np.stack([a.finalize() for a in accs], axis=0)
-        assert X.shape == (len(group_keys), n_genes), (
-            f"Shape mismatch for {cell_line_id}: {X.shape} vs "
-            f"({len(group_keys)}, {n_genes})"
+        path = write_cell_line_output(
+            cell_line_id,
+            {group_key: acc for group_key, acc in pairs},
+            gene_ids,
+            output_dir,
+            run_meta,
         )
-        assert np.all(np.isfinite(X)), f"Non-finite values in pseudobulk for {cell_line_id}"
+        if path is not None:
+            written.append(path)
 
-        obs = pd.DataFrame(
-            {
-                "drug": [g.drug for g in group_keys],
-                "drugname_drugconc": [g.drug_key for g in group_keys],
-                "sample": [g.sample for g in group_keys],
-                "plate": [g.plate for g in group_keys],
-                "BARCODE_SUB_LIB_ID": [g.barcode_sub_lib_id for g in group_keys],
-                "replicate_id": [g.replicate_id for g in group_keys],
-                "n_cells_total": [a.n_cells_seen for a in accs],
-                "n_complete_blocks": [a.n_complete_blocks for a in accs],
-                "n_cells_used": [a.n_cells_used for a in accs],
-                "n_cells_dropped": [a.n_cells_dropped for a in accs],
-            },
-            index=pd.Index([g.obs_index for g in group_keys], name=OBS_INDEX_NAME),
+    if not written:
+        raise RuntimeError(
+            "No replicate-aware groups had enough cells for even one complete "
+            f"block of size {run_meta.get('block_size', '?')}. "
+            f"Total groups seen: {len(accumulators)}, all excluded."
         )
-        var = pd.DataFrame(index=pd.Index(gene_ids, name="ensembl_id"))
-
-        adata = ad.AnnData(X=X, obs=obs, var=var)
-        adata.uns["cell_line_id"] = cell_line_id
-        adata.uns["pseudobulk_groupby_columns"] = list(GROUPBY_OBS_COLUMNS)
-        for k, v in run_meta.items():
-            adata.uns[k] = v
-
-        path = output_dir / f"{cell_line_id}.h5ad"
-        adata.write_h5ad(path)
-        log.info(
-            "Wrote %s  — shape %s (%d replicate-aware groups × %d genes)",
-            path,
-            X.shape,
-            X.shape[0],
-            X.shape[1],
-        )
-        written.append(path)
 
     return written
 
@@ -1233,6 +1385,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional override for progress percent/ETA total cell count",
     )
     p.add_argument(
+        "--overwrite-existing",
+        action="store_true",
+        help="Recompute cell-line outputs even when the final .h5ad already exists",
+    )
+    p.add_argument(
         "--smoke",
         action="store_true",
         help="Quick smoke test: sample_size=2000, writes to a temp dir",
@@ -1277,13 +1434,24 @@ def main(argv: list[str] | None = None) -> None:
         len(sample_metadata_by_sample),
     )
 
+    if args.cell_lines:
+        target_cell_line_ids = _normalize_cell_line_ids(args.cell_lines)
+        log.info(
+            "Using %d requested target cell lines from --cell-lines.",
+            len(target_cell_line_ids),
+        )
+    else:
+        target_cell_line_ids = load_target_cell_line_ids(
+            load_dataset_kwargs=hf_load_kwargs,
+        )
+    log.info("Resolved %d target cell lines.", len(target_cell_line_ids))
+    if args.progress_total_cells is not None and len(target_cell_line_ids) != 1:
+        log.warning(
+            "--progress-total-cells is ignored for multi-cell-line runs; "
+            "inner progress is reported per active cell line."
+        )
+
     # ---- Preflight and build ordered stream ----
-    cell_lines_whitelist = set(args.cell_lines) if args.cell_lines else None
-    progress_total_cells, progress_total_is_estimated = _resolve_progress_total_cells(
-        sample_size=args.sample_size,
-        progress_total_cells=args.progress_total_cells,
-        cell_lines_whitelist=cell_lines_whitelist,
-    )
     preflight_t0 = time.monotonic()
     stream_name = f"{DATASET_NAME} train split"
     log.info("Phase 3/4: schema preflight")
@@ -1300,87 +1468,171 @@ def main(argv: list[str] | None = None) -> None:
         time.monotonic() - preflight_t0,
     )
 
-    expression_load_kwargs = _build_expression_stream_load_kwargs(
-        hf_load_kwargs,
-        cell_lines_whitelist=cell_lines_whitelist,
-    )
-    _log_expression_stream_load_plan(expression_load_kwargs, cell_lines_whitelist)
-    stream_open_t0 = time.monotonic()
-    log.info("Opening filtered streaming train split from %s ...", DATASET_NAME)
-    raw_records = load_dataset(
-        DATASET_NAME,
-        streaming=True,
-        split="train",
-        **expression_load_kwargs,
-    )
-    log.info(
-        "Streaming train split initialized in %.1fs; waiting for first record ...",
-        time.monotonic() - stream_open_t0,
-    )
-    raw_records = _log_first_record_latency(
-        raw_records,
-        started_at=stream_open_t0,
-        stream_name=stream_name,
-    )
-    progress_reporter = _build_progress_reporter(
-        progress=args.progress,
-        progress_every=args.progress_every,
-        total_cells=progress_total_cells,
-        total_is_estimated=progress_total_is_estimated,
-        stream=sys.stderr,
-    )
-    log.info(
-        "%s (%s, %s)",
-        PROGRESS_PHASE_LABEL,
-        _describe_progress_mode(progress_reporter),
-        _describe_progress_total(progress_total_cells, progress_total_is_estimated),
-    )
-    ordered_stream = _iter_ordered_densified_records(
-        raw_records,
-        n_genes=n_genes,
-        token_to_col=token_to_col,
-        sample_metadata_by_sample=sample_metadata_by_sample,
-        sample_size=args.sample_size,
-        cell_lines_whitelist=cell_lines_whitelist,
-        num_workers=args.num_workers,
-    )
-
-    # ---- Accumulate ----
-    accumulators = run_pseudobulk(
-        ordered_stream,
-        n_genes=n_genes,
-        block_size=args.block_size,
-        progress_every=args.progress_every,
-        progress_reporter=progress_reporter,
-    )
-
-    # ---- Write outputs ----
     run_meta = {
         "block_size": args.block_size,
         "source_dataset": DATASET_NAME,
         "sample_size": args.sample_size if args.sample_size is not None else "full",
         "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }
-    written = write_outputs(accumulators, gene_ids, args.output_dir, run_meta)
+    total_target_cell_lines = len(target_cell_line_ids)
+    total_cells_processed = 0
+    total_cells_used = 0
+    total_cells_dropped = 0
+    total_groups_seen = 0
+    total_groups_with_blocks = 0
+    total_groups_without_blocks = 0
+    written: list[Path] = []
+    skipped_existing = 0
+    skipped_sparse_or_empty = 0
+    stopped_early_due_to_sample_size = False
+    remaining_sample_size = args.sample_size
+
+    log.info("Phase 4/4: streaming accumulation")
+    for index, cell_line_id in enumerate(target_cell_line_ids, start=1):
+        if remaining_sample_size is not None and remaining_sample_size <= 0:
+            stopped_early_due_to_sample_size = True
+            log.info(
+                "Stopping before cell line %d/%d (%s): global --sample-size budget exhausted.",
+                index,
+                total_target_cell_lines,
+                cell_line_id,
+            )
+            break
+
+        output_path = _cell_line_output_path(args.output_dir, cell_line_id)
+        output_exists = output_path.exists()
+        if output_exists and not args.overwrite_existing:
+            skipped_existing += 1
+            log.info(
+                "Cell line %d/%d: %s (skipped existing %s)",
+                index,
+                total_target_cell_lines,
+                cell_line_id,
+                output_path,
+            )
+            continue
+
+        action = "overwriting existing output" if output_exists else "processing"
+        log.info(
+            "Cell line %d/%d: %s (%s)",
+            index,
+            total_target_cell_lines,
+            cell_line_id,
+            action,
+        )
+
+        active_cell_lines = {cell_line_id}
+        expression_load_kwargs = _build_expression_stream_load_kwargs(
+            hf_load_kwargs,
+            cell_lines_whitelist=active_cell_lines,
+        )
+        _log_expression_stream_load_plan(expression_load_kwargs, active_cell_lines)
+
+        progress_total_cells, progress_total_is_estimated = _resolve_progress_total_cells(
+            remaining_sample_size=remaining_sample_size,
+            progress_total_cells=args.progress_total_cells,
+            target_cell_line_count=total_target_cell_lines,
+        )
+        stream_open_t0 = time.monotonic()
+        stream_name = f"{DATASET_NAME} train split (cell_line_id={cell_line_id})"
+        log.info("Opening filtered streaming train split from %s ...", DATASET_NAME)
+        raw_records = load_dataset(
+            DATASET_NAME,
+            streaming=True,
+            split="train",
+            **expression_load_kwargs,
+        )
+        log.info(
+            "Streaming train split initialized in %.1fs; waiting for first record ...",
+            time.monotonic() - stream_open_t0,
+        )
+        raw_records = _log_first_record_latency(
+            raw_records,
+            started_at=stream_open_t0,
+            stream_name=stream_name,
+        )
+
+        progress_reporter = _build_progress_reporter(
+            progress=args.progress,
+            progress_every=args.progress_every,
+            total_cells=progress_total_cells,
+            total_is_estimated=progress_total_is_estimated,
+            stream=sys.stderr,
+        )
+        log.info(
+            "%s (%s, %s)",
+            PROGRESS_PHASE_LABEL,
+            _describe_progress_mode(progress_reporter),
+            _describe_progress_total(progress_total_cells, progress_total_is_estimated),
+        )
+
+        ordered_stream = _iter_ordered_densified_records(
+            raw_records,
+            n_genes=n_genes,
+            token_to_col=token_to_col,
+            sample_metadata_by_sample=sample_metadata_by_sample,
+            sample_size=remaining_sample_size,
+            cell_lines_whitelist=active_cell_lines,
+            num_workers=args.num_workers,
+        )
+        accumulators = run_pseudobulk(
+            ordered_stream,
+            n_genes=n_genes,
+            block_size=args.block_size,
+            progress_every=args.progress_every,
+            progress_reporter=progress_reporter,
+        )
+        summary = _summarize_accumulators(accumulators)
+        total_cells_processed += summary.total_cells_processed
+        total_cells_used += summary.total_cells_used
+        total_cells_dropped += summary.total_cells_dropped
+        total_groups_seen += summary.total_groups
+        total_groups_with_blocks += summary.groups_with_blocks
+        total_groups_without_blocks += summary.groups_without_blocks
+        if remaining_sample_size is not None:
+            remaining_sample_size = max(
+                remaining_sample_size - summary.total_cells_processed,
+                0,
+            )
+
+        path = write_cell_line_output(
+            cell_line_id,
+            accumulators,
+            gene_ids,
+            args.output_dir,
+            run_meta,
+        )
+        if path is None:
+            skipped_sparse_or_empty += 1
+        else:
+            written.append(path)
+
+        del accumulators
+        gc.collect()
+
+    if not written and skipped_existing == 0:
+        raise RuntimeError(
+            "No cell lines produced any complete replicate-aware pseudobulk blocks "
+            f"with block size {args.block_size}."
+        )
 
     # ---- Summary ----
-    total_cells = sum(a.n_cells_seen for a in accumulators.values())
-    total_used = sum(a.n_cells_used for a in accumulators.values())
-    total_dropped = sum(a.n_cells_dropped for a in accumulators.values())
-    pairs_with_blocks = sum(
-        1 for a in accumulators.values() if a.n_complete_blocks > 0
-    )
-    pairs_without = len(accumulators) - pairs_with_blocks
-
     log.info("=" * 60)
     log.info("SUMMARY")
-    log.info("  Total cells processed   : %d", total_cells)
-    log.info("  Cells used in blocks    : %d", total_used)
-    log.info("  Cells dropped (remainder): %d", total_dropped)
-    log.info("  Unique replicate-aware groups: %d", len(accumulators))
-    log.info("    with ≥1 block         : %d", pairs_with_blocks)
-    log.info("    excluded (0 blocks)   : %d", pairs_without)
+    log.info("  Target cell lines       : %d", total_target_cell_lines)
+    log.info("  Total cells processed   : %d", total_cells_processed)
+    log.info("  Cells used in blocks    : %d", total_cells_used)
+    log.info("  Cells dropped (remainder): %d", total_cells_dropped)
+    log.info("  Unique replicate-aware groups: %d", total_groups_seen)
+    log.info("    with ≥1 block         : %d", total_groups_with_blocks)
+    log.info("    excluded (0 blocks)   : %d", total_groups_without_blocks)
     log.info("  Cell lines written      : %d", len(written))
+    log.info("  Cell lines skipped existing: %d", skipped_existing)
+    log.info("  Cell lines skipped sparse/empty: %d", skipped_sparse_or_empty)
+    log.info(
+        "  Stopped early via --sample-size: %s",
+        "yes" if stopped_early_due_to_sample_size else "no",
+    )
     log.info("  Output directory        : %s", args.output_dir)
     log.info("=" * 60)
 

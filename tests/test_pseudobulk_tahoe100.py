@@ -26,8 +26,10 @@ from pseudobulk_tahoe100 import (
     _densify_record,
     _log_first_record_latency,
     _iter_ordered_densified_records,
+    build_target_cell_line_ids,
     main,
     run_pseudobulk,
+    write_cell_line_output,
     write_outputs,
 )
 
@@ -399,6 +401,23 @@ def test_build_sample_metadata_lookup_requires_drugname_drugconc():
         )
 
 
+def test_build_target_cell_line_ids_normalizes_and_sorts():
+    """Cell-line metadata should normalize whitespace and return sorted unique ids."""
+    assert build_target_cell_line_ids(
+        [
+            {"cell_line_id": " CL_B "},
+            {"cell_line_id": "CL_A"},
+            {"cell_line_id": "CL_B"},
+        ]
+    ) == ["CL_A", "CL_B"]
+
+
+def test_build_target_cell_line_ids_requires_non_empty_values():
+    """Empty cell_line_id metadata should fail fast."""
+    with pytest.raises(RuntimeError, match="cell_line_id values must be non-empty"):
+        build_target_cell_line_ids([{"cell_line_id": " "}])
+
+
 def test_normalize_record_with_sample_metadata_enriches_row():
     """Current-schema stream rows should be enriched before densification."""
     lookup = pb.build_sample_metadata_lookup(
@@ -472,38 +491,29 @@ def test_normalize_record_with_sample_metadata_rejects_drug_or_plate_conflicts()
 # ---------------------------------------------------------------------------
 
 def test_resolve_progress_total_cells_prefers_sample_size():
-    """Explicit sample-size should define an exact total even with an override."""
+    """Remaining sample-size budget should define the active per-line total."""
     assert pb._resolve_progress_total_cells(
-        sample_size=2_000,
+        remaining_sample_size=2_000,
         progress_total_cells=9_999,
-        cell_lines_whitelist=None,
+        target_cell_line_count=3,
     ) == (2_000, False)
 
 
-def test_resolve_progress_total_cells_uses_override_when_uncapped():
-    """Manual total override should win when the run is otherwise uncapped."""
+def test_resolve_progress_total_cells_uses_override_for_single_target_run():
+    """Manual total override should apply when exactly one target cell line is active."""
     assert pb._resolve_progress_total_cells(
-        sample_size=None,
+        remaining_sample_size=None,
         progress_total_cells=12_345,
-        cell_lines_whitelist=None,
+        target_cell_line_count=1,
     ) == (12_345, False)
 
 
-def test_resolve_progress_total_cells_uses_full_dataset_estimate():
-    """Full unfiltered runs should use the Tahoe-100M estimate."""
+def test_resolve_progress_total_cells_ignores_override_for_multi_target_run():
+    """Multi-target runs should stay open-ended without a remaining sample budget."""
     assert pb._resolve_progress_total_cells(
-        sample_size=None,
-        progress_total_cells=None,
-        cell_lines_whitelist=None,
-    ) == (100_000_000, True)
-
-
-def test_resolve_progress_total_cells_returns_unknown_for_filtered_runs():
-    """Cell-line filtered runs should stay open-ended without an override."""
-    assert pb._resolve_progress_total_cells(
-        sample_size=None,
-        progress_total_cells=None,
-        cell_lines_whitelist={"CL_A"},
+        remaining_sample_size=None,
+        progress_total_cells=99_999,
+        target_cell_line_count=2,
     ) == (None, False)
 
 
@@ -774,6 +784,49 @@ def test_end_to_end_writes_h5ad(tmp_path):
         assert (adata.obs["n_cells_dropped"] == 0).all()
 
 
+def test_write_cell_line_output_returns_none_for_sparse_groups(tmp_path, caplog):
+    """Single-cell-line writer should skip empty/sparse outputs without raising."""
+    caplog.set_level(logging.WARNING, logger=pb.log.name)
+    acc = BlockAccumulator(n_genes=N_GENES_SMALL, block_size=2)
+    acc.add_cell(np.ones(N_GENES_SMALL, dtype=np.float32))
+    key = _group_key("CL_A", "DrugA_1uM", drug="DrugA", sample="S1", plate="P1")
+
+    path = write_cell_line_output(
+        "CL_A",
+        {key: acc},
+        np.array([f"ENSG{i:05d}" for i in range(N_GENES_SMALL)]),
+        tmp_path,
+        {"block_size": 2, "source_dataset": "test"},
+    )
+
+    assert path is None
+    assert "Cell line CL_A skipped" in caplog.text
+
+
+def test_write_cell_line_output_writes_atomically(tmp_path):
+    """Per-cell-line writes should land on the final path without stray temp files."""
+    gene_ids = np.array([f"ENSG{i:05d}" for i in range(N_GENES_SMALL)])
+    acc = BlockAccumulator(n_genes=N_GENES_SMALL, block_size=2)
+    for _ in range(2):
+        acc.add_cell(np.ones(N_GENES_SMALL, dtype=np.float32))
+    key = _group_key("CL_A", "DrugA_1uM", drug="DrugA", sample="S1", plate="P1")
+
+    path = write_cell_line_output(
+        "CL_A",
+        {key: acc},
+        gene_ids,
+        tmp_path,
+        {"block_size": 2, "source_dataset": "test"},
+    )
+
+    assert path == tmp_path / "CL_A.h5ad"
+    assert path.exists()
+    assert list(tmp_path.glob(".CL_A.*.h5ad")) == []
+    adata = ad.read_h5ad(path)
+    assert adata.uns["cell_line_id"] == "CL_A"
+    assert list(adata.obs["drugname_drugconc"]) == ["DrugA_1uM"]
+
+
 # ---------------------------------------------------------------------------
 # 8. test_parallel_matches_serial
 # ---------------------------------------------------------------------------
@@ -979,15 +1032,23 @@ def _install_main_fakes(
     stream_features=None,
     stream_rows=None,
     sample_metadata_rows=None,
+    cell_line_metadata_rows=None,
+    run_pseudobulk_side_effect=None,
+    write_cell_line_output_side_effect=None,
 ):
     """Patch networked entrypoints so ``main`` stays fully offline in tests."""
     load_calls = []
+    write_calls = []
     if stream_features is None:
         stream_features = _expression_stream_features()
     stream_rows = list(stream_rows or [])
     sample_metadata_rows = list(
         sample_metadata_rows
         or [_sample_metadata_row("S0", "Drug0", plate="P0", drug_key="Drug0_1uM")]
+    )
+    cell_line_metadata_rows = list(
+        cell_line_metadata_rows
+        or [{"cell_line_id": " CL_B "}, {"cell_line_id": "CL_A"}]
     )
 
     def fake_load_dataset(path, *args, **kwargs):
@@ -999,30 +1060,62 @@ def _install_main_fakes(
             ]
         if kwargs.get("name") == "sample_metadata":
             return sample_metadata_rows
+        if kwargs.get("name") == "cell_line_metadata":
+            return cell_line_metadata_rows
         return _FakeStreamDataset(stream_rows, features=stream_features)
 
+    def fake_run_pseudobulk(*args, **kwargs):
+        if run_pseudobulk_side_effect is not None:
+            return run_pseudobulk_side_effect(*args, **kwargs)
+
+        filters = load_calls[-1][1].get("filters") or [("cell_line_id", "in", ["CL_A"])]
+        cell_line_id = filters[0][2][0]
+        dense = np.ones(kwargs["n_genes"], dtype=np.float32)
+        acc = BlockAccumulator(
+            n_genes=kwargs["n_genes"],
+            block_size=kwargs["block_size"],
+        )
+        for _ in range(kwargs["block_size"]):
+            acc.add_cell(dense)
+        key = _group_key(
+            cell_line_id,
+            f"{cell_line_id}_1uM",
+            drug=f"{cell_line_id}_drug",
+            sample=f"{cell_line_id}_sample",
+            plate="P0",
+            barcode_sub_lib_id="B0",
+        )
+        return {key: acc}
+
+    def fake_write_cell_line_output(cell_line_id, accumulators, gene_ids, output_dir, run_meta):
+        write_calls.append((cell_line_id, output_dir, run_meta.copy()))
+        if write_cell_line_output_side_effect is not None:
+            return write_cell_line_output_side_effect(
+                cell_line_id,
+                accumulators,
+                gene_ids,
+                output_dir,
+                run_meta,
+            )
+        return output_dir / f"{cell_line_id}.h5ad"
+
     monkeypatch.setattr(pb, "load_dataset", fake_load_dataset)
-    monkeypatch.setattr(pb, "run_pseudobulk", lambda *args, **kwargs: {})
-    monkeypatch.setattr(pb, "write_outputs", lambda *args, **kwargs: [])
-    return load_calls
+    monkeypatch.setattr(pb, "run_pseudobulk", fake_run_pseudobulk)
+    monkeypatch.setattr(pb, "write_cell_line_output", fake_write_cell_line_output)
+    return load_calls, write_calls
 
 
 def test_main_forwards_hf_token_to_all_dataset_loads(monkeypatch, caplog):
     """Explicit HF_TOKEN should be forwarded to every Tahoe dataset load."""
-    load_calls = _install_main_fakes(monkeypatch)
+    load_calls, _ = _install_main_fakes(monkeypatch)
     monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
     monkeypatch.setenv("HF_TOKEN", "hf_secret_value")
     caplog.set_level(logging.INFO, logger=pb.log.name)
 
     main(["--smoke", "--num-workers", "0"])
 
-    assert len(load_calls) == 4
-    assert [call[0] for call in load_calls] == [
-        pb.DATASET_NAME,
-        pb.DATASET_NAME,
-        pb.DATASET_NAME,
-        pb.DATASET_NAME,
-    ]
+    assert len(load_calls) == 6
+    assert all(call[0] == pb.DATASET_NAME for call in load_calls)
     assert all(call[1]["token"] == "hf_secret_value" for call in load_calls)
     assert "Using Hugging Face env token from HF_TOKEN." in caplog.text
     assert "hf_secret_value" not in caplog.text
@@ -1030,14 +1123,14 @@ def test_main_forwards_hf_token_to_all_dataset_loads(monkeypatch, caplog):
 
 def test_main_accepts_legacy_hf_token_env_with_warning(monkeypatch, caplog):
     """Legacy env var still works, but it should warn and prefer the new name."""
-    load_calls = _install_main_fakes(monkeypatch)
+    load_calls, _ = _install_main_fakes(monkeypatch)
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.setenv("HUGGING_FACE_HUB_TOKEN", "legacy_secret")
     caplog.set_level(logging.INFO, logger=pb.log.name)
 
     main(["--smoke", "--num-workers", "0"])
 
-    assert len(load_calls) == 4
+    assert len(load_calls) == 6
     assert all(call[1]["token"] == "legacy_secret" for call in load_calls)
     assert "deprecated; prefer HF_TOKEN" in caplog.text
     assert "Using Hugging Face env token from HUGGING_FACE_HUB_TOKEN." in caplog.text
@@ -1046,14 +1139,14 @@ def test_main_accepts_legacy_hf_token_env_with_warning(monkeypatch, caplog):
 
 def test_main_without_env_token_uses_default_auth_resolution(monkeypatch, caplog):
     """No env token should keep default Hugging Face auth behavior untouched."""
-    load_calls = _install_main_fakes(monkeypatch)
+    load_calls, _ = _install_main_fakes(monkeypatch)
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
     caplog.set_level(logging.INFO, logger=pb.log.name)
 
     main(["--smoke", "--num-workers", "0"])
 
-    assert len(load_calls) == 4
+    assert len(load_calls) == 6
     assert all("token" not in call[1] for call in load_calls)
     assert (
         "No Hugging Face env token configured; relying on saved login or anonymous access."
@@ -1063,24 +1156,24 @@ def test_main_without_env_token_uses_default_auth_resolution(monkeypatch, caplog
 
 def test_main_forwards_hf_cache_dir_to_all_dataset_loads(monkeypatch, tmp_path):
     """CLI cache-dir override should be shared across every Tahoe dataset load."""
-    load_calls = _install_main_fakes(monkeypatch)
+    load_calls, _ = _install_main_fakes(monkeypatch)
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
     cache_dir = tmp_path / "hf_cache"
 
     main(["--smoke", "--num-workers", "0", "--hf-cache-dir", str(cache_dir)])
 
-    assert len(load_calls) == 4
+    assert len(load_calls) == 6
     assert all(call[1]["cache_dir"] == str(cache_dir) for call in load_calls)
 
 
 def test_main_accepts_current_expression_schema_and_requests_columns(monkeypatch):
     """Current Tahoe expression schema should preflight, then open a pruned stream."""
-    load_calls = _install_main_fakes(monkeypatch)
+    load_calls, write_calls = _install_main_fakes(monkeypatch)
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
 
-    main(["--smoke", "--num-workers", "0"])
+    main(["--smoke", "--num-workers", "0", "--cell-lines", "CL_A"])
 
     assert len(load_calls) == 4
     assert load_calls[0][1]["name"] == "gene_metadata"
@@ -1090,25 +1183,45 @@ def test_main_accepts_current_expression_schema_and_requests_columns(monkeypatch
     assert "columns" not in preflight_kwargs
     assert "filters" not in preflight_kwargs
     assert stream_kwargs["columns"] == list(pb.REQUIRED_EXPRESSION_STREAM_COLUMNS)
-    assert "filters" not in stream_kwargs
+    assert stream_kwargs["filters"] == [("cell_line_id", "in", ["CL_A"])]
+    assert [call[0] for call in write_calls] == ["CL_A"]
 
 
 def test_main_adds_cell_line_filter_to_expression_stream_load(monkeypatch):
     """A cell-line whitelist should be forwarded as a Parquet filter."""
-    load_calls = _install_main_fakes(monkeypatch)
+    load_calls, write_calls = _install_main_fakes(monkeypatch)
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
 
     main(["--smoke", "--num-workers", "0", "--cell-lines", "CL_B", "CL_A"])
 
-    assert len(load_calls) == 4
-    stream_kwargs = load_calls[3][1]
-    assert stream_kwargs["filters"] == [("cell_line_id", "in", ["CL_A", "CL_B"])]
+    assert len(load_calls) == 5
+    assert load_calls[2][1].get("streaming") is True
+    stream_kwargs_a = load_calls[3][1]
+    stream_kwargs_b = load_calls[4][1]
+    assert stream_kwargs_a["filters"] == [("cell_line_id", "in", ["CL_A"])]
+    assert stream_kwargs_b["filters"] == [("cell_line_id", "in", ["CL_B"])]
+    assert [call[0] for call in write_calls] == ["CL_A", "CL_B"]
+
+
+def test_main_without_whitelist_loads_cell_line_metadata_and_processes_each_line(monkeypatch):
+    """Unfiltered runs should resolve target ids from cell_line_metadata and stream one line at a time."""
+    load_calls, write_calls = _install_main_fakes(monkeypatch)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+
+    main(["--smoke", "--num-workers", "0"])
+
+    assert len(load_calls) == 6
+    assert load_calls[2][1]["name"] == "cell_line_metadata"
+    assert load_calls[4][1]["filters"] == [("cell_line_id", "in", ["CL_A"])]
+    assert load_calls[5][1]["filters"] == [("cell_line_id", "in", ["CL_B"])]
+    assert [call[0] for call in write_calls] == ["CL_A", "CL_B"]
 
 
 def test_main_fails_fast_when_expression_stream_misses_current_required_column(monkeypatch):
     """Schema preflight should still reject genuinely incompatible expression rows."""
-    load_calls = _install_main_fakes(
+    load_calls, _ = _install_main_fakes(
         monkeypatch,
         stream_features=_expression_stream_features(missing_columns=("sample",)),
     )
@@ -1118,12 +1231,12 @@ def test_main_fails_fast_when_expression_stream_misses_current_required_column(m
     with pytest.raises(RuntimeError, match="missing required columns \\['sample'\\]"):
         main(["--smoke", "--num-workers", "0"])
 
-    assert len(load_calls) == 3
+    assert len(load_calls) == 4
 
 
 def test_main_fails_fast_when_sample_metadata_is_incomplete(monkeypatch):
     """Startup should abort before streaming when sample_metadata is incomplete."""
-    load_calls = _install_main_fakes(
+    load_calls, _ = _install_main_fakes(
         monkeypatch,
         sample_metadata_rows=[
             {
@@ -1177,6 +1290,121 @@ def test_main_logs_progress_phases(monkeypatch, caplog):
     assert "Phase 2/4: loading sample metadata" in caplog.text
     assert "Phase 3/4: schema preflight" in caplog.text
     assert "Phase 4/4: streaming accumulation" in caplog.text
+
+
+def test_main_logs_outer_cell_line_progress(monkeypatch, caplog):
+    """Per-cell-line runs should log deterministic outer progress counters."""
+    _install_main_fakes(monkeypatch)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    caplog.set_level(logging.INFO, logger=pb.log.name)
+
+    main(["--smoke", "--num-workers", "0"])
+
+    assert "Cell line 1/2: CL_A (processing)" in caplog.text
+    assert "Cell line 2/2: CL_B (processing)" in caplog.text
+
+
+def test_main_skips_existing_outputs_without_restreaming(monkeypatch, tmp_path):
+    """Existing final outputs should be skipped by default on rerun."""
+    load_calls, write_calls = _install_main_fakes(monkeypatch)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    (output_dir / "CL_A.h5ad").write_text("existing")
+
+    main(
+        [
+            "--num-workers",
+            "0",
+            "--cell-lines",
+            "CL_A",
+            "CL_B",
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    assert len(load_calls) == 4
+    assert load_calls[3][1]["filters"] == [("cell_line_id", "in", ["CL_B"])]
+    assert [call[0] for call in write_calls] == ["CL_B"]
+
+
+def test_main_overwrite_existing_recomputes(monkeypatch, tmp_path):
+    """--overwrite-existing should force processing even when outputs already exist."""
+    load_calls, write_calls = _install_main_fakes(monkeypatch)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    (output_dir / "CL_A.h5ad").write_text("existing")
+
+    main(
+        [
+            "--num-workers",
+            "0",
+            "--cell-lines",
+            "CL_A",
+            "CL_B",
+            "--output-dir",
+            str(output_dir),
+            "--overwrite-existing",
+        ]
+    )
+
+    assert len(load_calls) == 5
+    assert load_calls[3][1]["filters"] == [("cell_line_id", "in", ["CL_A"])]
+    assert load_calls[4][1]["filters"] == [("cell_line_id", "in", ["CL_B"])]
+    assert [call[0] for call in write_calls] == ["CL_A", "CL_B"]
+
+
+def test_main_stops_later_cell_lines_when_global_sample_size_is_exhausted(monkeypatch, tmp_path):
+    """The global sample-size budget should stop scheduling later cell lines."""
+    load_calls, write_calls = _install_main_fakes(monkeypatch)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+
+    main(
+        [
+            "--num-workers",
+            "0",
+            "--cell-lines",
+            "CL_A",
+            "CL_B",
+            "--sample-size",
+            "1",
+            "--output-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert len(load_calls) == 4
+    assert load_calls[3][1]["filters"] == [("cell_line_id", "in", ["CL_A"])]
+    assert [call[0] for call in write_calls] == ["CL_A"]
+
+
+def test_main_warns_when_progress_total_is_ignored_for_multi_target_runs(monkeypatch, caplog):
+    """Global progress-total overrides should warn when multiple cell lines are scheduled."""
+    _install_main_fakes(monkeypatch)
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    caplog.set_level(logging.INFO, logger=pb.log.name)
+
+    main(
+        [
+            "--smoke",
+            "--num-workers",
+            "0",
+            "--cell-lines",
+            "CL_A",
+            "CL_B",
+            "--progress-total-cells",
+            "123",
+        ]
+    )
+
+    assert "--progress-total-cells is ignored for multi-cell-line runs" in caplog.text
 
 
 def test_first_record_latency_logs(monkeypatch, caplog):
