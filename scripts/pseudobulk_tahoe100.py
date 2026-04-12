@@ -2,11 +2,9 @@
 """Pseudobulk Tahoe-100M single-cell data into per-cell-line AnnData files.
 
 For each replicate-aware group
-``(cell_line, drug+concentration, sample, plate, BARCODE_SUB_LIB_ID)``, cells
-are partitioned into non-overlapping blocks of exactly ``block_size`` (default
-200). Each block is summed, then the block-sums are averaged. Cells beyond the
-last complete block are dropped. The output is one ``.h5ad`` file per cell
-line containing an ``n_groups × n_genes`` matrix, with replicate metadata
+``(cell_line, drug+concentration, sample, plate)``, cells are summed and
+scaled to produce one pseudobulk row. The output is one ``.h5ad`` file per
+cell line containing an ``n_groups × n_genes`` matrix, with replicate metadata
 stored in ``adata.obs`` for downstream batch-effect modeling and replicate QC.
 
 Parallelism
@@ -71,7 +69,6 @@ GROUPBY_OBS_COLUMNS = (
     "drugname_drugconc",
     "sample",
     "plate",
-    "BARCODE_SUB_LIB_ID",
 )
 OBS_INDEX_NAME = "pseudobulk_group"
 REQUIRED_SAMPLE_METADATA_COLUMNS = (
@@ -103,19 +100,17 @@ class PseudobulkGroupKey:
     drug: str = ""
     sample: str = ""
     plate: str = ""
-    barcode_sub_lib_id: str = ""
 
     @property
     def replicate_id(self) -> str:
         """Return the best available replicate identifier for display."""
-        return self.barcode_sub_lib_id or self.sample or self.plate or self.drug_key
+        return self.sample or self.plate or self.drug_key
 
     @property
     def obs_index(self) -> str:
         """Stable obs index string for this replicate-aware group."""
         return (
             f"drug={self.drug_key}|sample={self.sample}|plate={self.plate}"
-            f"|barcode={self.barcode_sub_lib_id}"
         )
 
 
@@ -139,7 +134,7 @@ class AccumulatorSummary:
     total_groups: int
     groups_with_blocks: int
     groups_without_blocks: int
-    shortfalls: tuple[tuple[int, str, str, str, str, str], ...] = ()
+    shortfalls: tuple[tuple[int, str, str, str, str], ...] = ()
 
 
 _TQDM_FACTORY = _tqdm
@@ -1006,7 +1001,6 @@ def _group_key_from_record(record: dict) -> PseudobulkGroupKey | None:
         drug=drug,
         sample=_stringify_record_value(record, "sample"),
         plate=_stringify_record_value(record, "plate"),
-        barcode_sub_lib_id=_stringify_record_value(record, "BARCODE_SUB_LIB_ID"),
     )
 
 
@@ -1204,7 +1198,6 @@ def _summarize_accumulators(
                     matrix_acc.keys[i].drug_key,
                     matrix_acc.keys[i].sample,
                     matrix_acc.keys[i].plate,
-                    matrix_acc.keys[i].barcode_sub_lib_id,
                 )
                 for i in range(matrix_acc.n_active)
                 if counts[i] < block_size
@@ -1292,7 +1285,6 @@ def write_cell_line_output(
             "drugname_drugconc": [group_key.drug_key for group_key in group_keys],
             "sample": [group_key.sample for group_key in group_keys],
             "plate": [group_key.plate for group_key in group_keys],
-            "BARCODE_SUB_LIB_ID": [group_key.barcode_sub_lib_id for group_key in group_keys],
             "replicate_id": [group_key.replicate_id for group_key in group_keys],
             "n_cells_total": valid_counts.tolist(),
             # n_complete_blocks is informational; the actual math uses all cells.
