@@ -12,7 +12,9 @@ dependencies = [
   "pandas",
   "pyarrow",
   "requests",
+  "scikit-learn",
   "scipy",
+  "seaborn",
 ]
 
 [build-system]
