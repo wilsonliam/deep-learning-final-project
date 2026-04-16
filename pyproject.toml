@@ -11,10 +11,12 @@ dependencies = [
   "numpy",
   "pandas",
   "pyarrow",
+  "rdkit",
   "requests",
   "scikit-learn",
   "scipy",
   "seaborn",
+  "torch",
 ]
 
 [build-system]
