@@ -8,6 +8,7 @@ dependencies = [
   "anndata",
   "datasets",
   "h5py",
+  "lightning",
   "numpy",
   "pandas",
   "pyarrow",
