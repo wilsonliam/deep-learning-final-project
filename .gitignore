@@ -100,3 +100,15 @@ artifacts/lightning/linear_regression/mixed_mlp_delta/version_1/metrics.csv
 artifacts/lightning/linear_regression/mixed_ridge_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=781.801575.ckpt
 artifacts/lightning/linear_regression/mixed_ridge_delta/version_7/hparams.yaml
 artifacts/lightning/linear_regression/mixed_ridge_delta/version_7/metrics.csv
+artifacts/lightning/linear_regression/drug_blind_mlp_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=594.855835.ckpt
+artifacts/lightning/linear_regression/drug_blind_mlp_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=3180.555664.ckpt
+artifacts/lightning/linear_regression/drug_blind_mlp_delta/checkpoints/epoch=epoch=01-val_loss=val_loss=594.130615.ckpt
+artifacts/lightning/linear_regression/drug_blind_mlp_delta/version_0/hparams.yaml
+artifacts/lightning/linear_regression/drug_blind_mlp_delta/version_0/metrics.csv
+artifacts/lightning/linear_regression/drug_blind_mlp_delta/version_1/hparams.yaml
+artifacts/lightning/linear_regression/drug_blind_mlp_delta/version_1/metrics.csv
+artifacts/lightning/linear_regression/drug_blind_mlp_delta/version_2/hparams.yaml
+artifacts/lightning/linear_regression/drug_blind_mlp_delta/version_2/metrics.csv
+artifacts/lightning/linear_regression/drug_blind_ridge_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=27885.990234.ckpt
+artifacts/lightning/linear_regression/drug_blind_ridge_delta/version_0/hparams.yaml
+artifacts/lightning/linear_regression/drug_blind_ridge_delta/version_0/metrics.csv

@@ -411,6 +411,48 @@ def compute_mann_whitney_batch(predicted_expression, target_expression):
     )
 
 
+def compute_topk_deg_metrics_batch(predicted_delta, target_delta, top_k=50):
+    predicted_delta_np = predicted_delta.detach().cpu().numpy()
+    target_delta_np = target_delta.detach().cpu().numpy()
+    topk_match_counts = []
+    topk_match_fractions = []
+    signed_ndcg_at_k_values = []
+
+    for predicted_row, target_row in zip(predicted_delta_np, target_delta_np):
+        effective_k = min(int(top_k), int(predicted_row.shape[0]), int(target_row.shape[0]))
+        if effective_k <= 0:
+            topk_match_counts.append(0.0)
+            topk_match_fractions.append(float("nan"))
+            signed_ndcg_at_k_values.append(float("nan"))
+            continue
+
+        truth_topk = np.argsort(-np.abs(target_row), kind="stable")[:effective_k]
+        predicted_topk = np.argsort(-np.abs(predicted_row), kind="stable")[:effective_k]
+        predicted_topk_set = set(predicted_topk.tolist())
+        match_count = len(set(truth_topk.tolist()) & predicted_topk_set)
+
+        discounts = 1.0 / np.log2(np.arange(2, effective_k + 2, dtype=np.float64))
+        ideal_gains = np.abs(target_row[truth_topk]).astype(np.float64)
+        ideal_dcg = float(np.sum(ideal_gains * discounts))
+        if ideal_dcg <= 0:
+            signed_ndcg_at_k = 0.0
+        else:
+            signed_relevance = np.abs(target_row[predicted_topk]).astype(np.float64)
+            sign_matches = (np.sign(predicted_row[predicted_topk]) == np.sign(target_row[predicted_topk])).astype(np.float64)
+            signed_dcg = float(np.sum(signed_relevance * sign_matches * discounts))
+            signed_ndcg_at_k = signed_dcg / ideal_dcg
+
+        topk_match_counts.append(float(match_count))
+        topk_match_fractions.append(float(match_count / effective_k))
+        signed_ndcg_at_k_values.append(float(signed_ndcg_at_k))
+
+    return (
+        np.asarray(topk_match_counts, dtype=np.float64),
+        np.asarray(topk_match_fractions, dtype=np.float64),
+        np.asarray(signed_ndcg_at_k_values, dtype=np.float64),
+    )
+
+
 def evaluate_model_on_loader(
     model,
     loader,
@@ -419,6 +461,7 @@ def evaluate_model_on_loader(
     max_inspection_rows=3,
     n_inspection_genes=5,
     mann_whitney_alpha=0.05,
+    deg_top_k=50,
 ):
     device = next(model.parameters()).device
     selected_gene_ids = list(gene_ids[:n_inspection_genes])
@@ -428,6 +471,9 @@ def evaluate_model_on_loader(
     treated_cosine_sum = 0.0
     mann_whitney_u_values = []
     mann_whitney_pvalues = []
+    top50_deg_match_counts = []
+    top50_deg_match_fractions = []
+    signed_ndcg_at_50_values = []
     inspection_rows = []
     prediction_detail_rows = []
 
@@ -448,6 +494,15 @@ def evaluate_model_on_loader(
                 predicted_expression,
                 target_expression,
             )
+            (
+                per_sample_top50_deg_match_count,
+                per_sample_top50_deg_match_fraction,
+                per_sample_signed_ndcg_at_50,
+            ) = compute_topk_deg_metrics_batch(
+                predicted_delta,
+                target_delta,
+                top_k=deg_top_k,
+            )
 
             batch_rows = int(target_delta.shape[0])
             total_rows += batch_rows
@@ -456,6 +511,9 @@ def evaluate_model_on_loader(
             treated_cosine_sum += float(per_sample_treated_cosine.sum().item())
             mann_whitney_u_values.extend(per_sample_mann_whitney_u.tolist())
             mann_whitney_pvalues.extend(per_sample_mann_whitney_pvalue.tolist())
+            top50_deg_match_counts.extend(per_sample_top50_deg_match_count.tolist())
+            top50_deg_match_fractions.extend(per_sample_top50_deg_match_fraction.tolist())
+            signed_ndcg_at_50_values.extend(per_sample_signed_ndcg_at_50.tolist())
 
             rows_needed = max(0, max_inspection_rows - len(inspection_rows))
             for row_idx in range(min(rows_needed, batch_rows)):
@@ -469,6 +527,9 @@ def evaluate_model_on_loader(
                     "sample_treated_cosine": float(per_sample_treated_cosine[row_idx].detach().cpu().item()),
                     "sample_mann_whitney_u": float(per_sample_mann_whitney_u[row_idx]),
                     "sample_mann_whitney_pvalue": float(per_sample_mann_whitney_pvalue[row_idx]),
+                    "sample_top50_deg_match_count": float(per_sample_top50_deg_match_count[row_idx]),
+                    "sample_top50_deg_match_fraction": float(per_sample_top50_deg_match_fraction[row_idx]),
+                    "sample_signed_ndcg_at_50": float(per_sample_signed_ndcg_at_50[row_idx]),
                 }
                 for gene_offset, gene_id in enumerate(selected_gene_ids):
                     inspection_row[f"pred_{gene_id}"] = float(predicted_expression[row_idx, gene_offset].detach().cpu().item())
@@ -499,11 +560,17 @@ def evaluate_model_on_loader(
                         "treated_cosine": float(treated_cosine_values[row_idx]),
                         "mann_whitney_u": float(per_sample_mann_whitney_u[row_idx]),
                         "mann_whitney_pvalue": float(per_sample_mann_whitney_pvalue[row_idx]),
+                        "top50_deg_match_count": float(per_sample_top50_deg_match_count[row_idx]),
+                        "top50_deg_match_fraction": float(per_sample_top50_deg_match_fraction[row_idx]),
+                        "signed_ndcg_at_50": float(per_sample_signed_ndcg_at_50[row_idx]),
                     }
                 )
 
     mann_whitney_u_values = np.asarray(mann_whitney_u_values, dtype=np.float64)
     mann_whitney_pvalues = np.asarray(mann_whitney_pvalues, dtype=np.float64)
+    top50_deg_match_counts = np.asarray(top50_deg_match_counts, dtype=np.float64)
+    top50_deg_match_fractions = np.asarray(top50_deg_match_fractions, dtype=np.float64)
+    signed_ndcg_at_50_values = np.asarray(signed_ndcg_at_50_values, dtype=np.float64)
 
     metrics = {
         "split": split_name,
@@ -515,6 +582,12 @@ def evaluate_model_on_loader(
         "mann_whitney_pvalue_mean": float(np.mean(mann_whitney_pvalues)) if total_rows else float("nan"),
         "mann_whitney_pvalue_median": float(np.median(mann_whitney_pvalues)) if total_rows else float("nan"),
         "mann_whitney_not_significant_fraction": float(np.mean(mann_whitney_pvalues >= mann_whitney_alpha)) if total_rows else float("nan"),
+        "top50_deg_match_count_mean": float(np.mean(top50_deg_match_counts)) if total_rows else float("nan"),
+        "top50_deg_match_count_median": float(np.median(top50_deg_match_counts)) if total_rows else float("nan"),
+        "top50_deg_match_fraction_mean": float(np.mean(top50_deg_match_fractions)) if total_rows else float("nan"),
+        "top50_deg_match_fraction_median": float(np.median(top50_deg_match_fractions)) if total_rows else float("nan"),
+        "signed_ndcg_at_50_mean": float(np.mean(signed_ndcg_at_50_values)) if total_rows else float("nan"),
+        "signed_ndcg_at_50_median": float(np.median(signed_ndcg_at_50_values)) if total_rows else float("nan"),
     }
     inspection_df = pd.DataFrame(inspection_rows)
     prediction_details_df = pd.DataFrame(prediction_detail_rows)
@@ -641,6 +714,9 @@ def build_prediction_pair_embedding(model, dataset, sampled_prediction_details_d
                 "treated_cosine": float(metadata_row["treated_cosine"]),
                 "mann_whitney_u": float(metadata_row["mann_whitney_u"]),
                 "mann_whitney_pvalue": float(metadata_row["mann_whitney_pvalue"]),
+                "top50_deg_match_count": float(metadata_row["top50_deg_match_count"]),
+                "top50_deg_match_fraction": float(metadata_row["top50_deg_match_fraction"]),
+                "signed_ndcg_at_50": float(metadata_row["signed_ndcg_at_50"]),
                 "pair_distance_2d": pair_distance_2d,
             }
         )
