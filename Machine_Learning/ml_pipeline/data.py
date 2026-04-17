@@ -198,16 +198,20 @@ class PreparedTreatmentDataset(Dataset):
         baseline_expression = self.preprocessor.dmso_target_expression_lookup[baseline_index]
         target_expression = self.preprocessor.treatment_expression_lookup[target_index]
         target_delta = target_expression - baseline_expression
-        normalized_baseline = self.preprocessor.normalized_dmso_input_expression_lookup[baseline_index]
-        fingerprint = self.preprocessor.fingerprint_lookup[fingerprint_index]
+        gene_features = self.preprocessor.normalized_dmso_input_expression_lookup[baseline_index]
+        drug_features = self.preprocessor.fingerprint_lookup[fingerprint_index]
+        dose_feature = self.scaled_doses[idx].view(1)
         input_features = torch.cat(
-            [normalized_baseline, fingerprint, self.scaled_doses[idx].view(1)],
+            [gene_features, drug_features, dose_feature],
             dim=0,
         )
 
         return {
             "dataset_index": int(idx),
             "input_features": input_features,
+            "gene_features": gene_features,
+            "drug_features": drug_features,
+            "dose_feature": dose_feature,
             "baseline_expression": baseline_expression,
             "target_delta": target_delta,
             "concentration": self.concentrations[idx],

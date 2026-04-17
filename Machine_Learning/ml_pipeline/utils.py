@@ -435,7 +435,7 @@ def evaluate_model_on_loader(
     with torch.no_grad():
         for batch in loader:
             batch = move_batch_to_device(batch, device)
-            predicted_delta = model(batch["input_features"])
+            predicted_delta = model(batch)
             target_delta = batch["target_delta"]
             predicted_expression = batch["baseline_expression"] + predicted_delta
             target_expression = batch["baseline_expression"] + target_delta
@@ -581,13 +581,18 @@ def build_prediction_pair_embedding(model, dataset, sampled_prediction_details_d
 
     device = next(model.parameters()).device
     selected_examples = [dataset[int(dataset_index)] for dataset_index in sampled_prediction_details_df["dataset_index"].tolist()]
-    input_features = torch.stack([example["input_features"] for example in selected_examples], dim=0).to(device)
+    model_input_batch = {
+        "input_features": torch.stack([example["input_features"] for example in selected_examples], dim=0).to(device),
+        "gene_features": torch.stack([example["gene_features"] for example in selected_examples], dim=0).to(device),
+        "drug_features": torch.stack([example["drug_features"] for example in selected_examples], dim=0).to(device),
+        "dose_feature": torch.stack([example["dose_feature"] for example in selected_examples], dim=0).to(device),
+    }
     baseline_expression = torch.stack([example["baseline_expression"] for example in selected_examples], dim=0).to(device)
     target_delta = torch.stack([example["target_delta"] for example in selected_examples], dim=0).to(device)
 
     model.eval()
     with torch.no_grad():
-        predicted_delta = model(input_features)
+        predicted_delta = model(model_input_batch)
         predicted_expression = baseline_expression + predicted_delta
         actual_expression = baseline_expression + target_delta
 

@@ -91,3 +91,12 @@ artifacts/lightning/linear_regression/mixed_ridge_delta/version_5/hparams.yaml
 artifacts/lightning/linear_regression/mixed_ridge_delta/version_5/metrics.csv
 artifacts/lightning/linear_regression/mixed_ridge_delta/version_6/hparams.yaml
 artifacts/lightning/linear_regression/mixed_ridge_delta/version_6/metrics.csv
+artifacts/lightning/linear_regression/mixed_mlp_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=741.152893.ckpt
+artifacts/lightning/linear_regression/mixed_mlp_delta/checkpoints/epoch=epoch=16-val_loss=val_loss=489.628082.ckpt
+artifacts/lightning/linear_regression/mixed_mlp_delta/version_0/hparams.yaml
+artifacts/lightning/linear_regression/mixed_mlp_delta/version_0/metrics.csv
+artifacts/lightning/linear_regression/mixed_mlp_delta/version_1/hparams.yaml
+artifacts/lightning/linear_regression/mixed_mlp_delta/version_1/metrics.csv
+artifacts/lightning/linear_regression/mixed_ridge_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=781.801575.ckpt
+artifacts/lightning/linear_regression/mixed_ridge_delta/version_7/hparams.yaml
+artifacts/lightning/linear_regression/mixed_ridge_delta/version_7/metrics.csv
