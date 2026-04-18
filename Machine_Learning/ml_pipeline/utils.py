@@ -328,6 +328,113 @@ def build_overlap_diagnostics(split_frame, split_mode):
     return pd.DataFrame(rows)
 
 
+def audit_plate_drug_confound(
+    examples_df,
+    dmso_expression_lookup,
+    treatment_expression_lookup,
+    plate_column="plate",
+    drug_column="drug",
+    ridge_alpha=1.0,
+):
+    required_columns = (plate_column, drug_column, "baseline_index", "target_index")
+    missing_columns = [column for column in required_columns if column not in examples_df.columns]
+    if missing_columns:
+        raise ValueError(
+            "examples_df is missing required columns for the plate/drug audit: "
+            f"{missing_columns}"
+        )
+
+    from sklearn.linear_model import Ridge
+
+    audit_frame = examples_df.loc[:, required_columns].reset_index(drop=True).copy()
+    if audit_frame.empty:
+        raise ValueError("examples_df is empty; cannot audit plate/drug confounding.")
+
+    plate_drug_counts = pd.crosstab(
+        audit_frame[plate_column],
+        audit_frame[drug_column],
+        dropna=False,
+    ).sort_index(axis=0).sort_index(axis=1)
+    if plate_drug_counts.shape[0] < 2:
+        raise ValueError("Need at least two plates to audit plate/drug confounding.")
+    if plate_drug_counts.shape[1] < 2:
+        raise ValueError("Need at least two drugs to audit plate/drug confounding.")
+
+    plate_drug_fraction_df = plate_drug_counts.div(plate_drug_counts.sum(axis=1), axis=0).fillna(0.0)
+
+    baseline_indices = torch.as_tensor(
+        audit_frame["baseline_index"].to_numpy(np.int64),
+        dtype=torch.long,
+    )
+    target_indices = torch.as_tensor(
+        audit_frame["target_index"].to_numpy(np.int64),
+        dtype=torch.long,
+    )
+
+    dmso_lookup_tensor = torch.as_tensor(dmso_expression_lookup, dtype=torch.float32)
+    treatment_lookup_tensor = torch.as_tensor(treatment_expression_lookup, dtype=torch.float32)
+
+    baseline_expression = dmso_lookup_tensor.index_select(0, baseline_indices)
+    target_expression = treatment_lookup_tensor.index_select(0, target_indices)
+    delta_expression = (target_expression - baseline_expression).detach().cpu().numpy().astype(np.float64, copy=False)
+
+    plate_mean_delta_rows = []
+    plate_summary_rows = []
+    for plate_name, plate_subset in audit_frame.groupby(plate_column, sort=True, dropna=False):
+        plate_mask = plate_subset.index.to_numpy(np.int64)
+        plate_delta = delta_expression[plate_mask]
+        plate_counts = plate_drug_counts.loc[plate_name]
+        plate_mean_delta_rows.append(plate_delta.mean(axis=0))
+        plate_summary_rows.append(
+            {
+                "plate": plate_name,
+                "n_rows": int(len(plate_subset)),
+                "n_unique_drugs": int(plate_subset[drug_column].nunique(dropna=False)),
+                "top_drug_fraction": float(plate_drug_fraction_df.loc[plate_name].max()),
+                "delta_l2_norm": float(np.linalg.norm(plate_delta.mean(axis=0))),
+                "dominant_drug": str(plate_counts.idxmax()),
+                "dominant_drug_rows": int(plate_counts.max()),
+            }
+        )
+
+    plate_mean_delta = np.stack(plate_mean_delta_rows, axis=0)
+    feature_matrix = plate_drug_fraction_df.to_numpy(dtype=np.float64, copy=False)
+
+    ridge = Ridge(alpha=float(ridge_alpha), fit_intercept=True)
+    ridge.fit(feature_matrix, plate_mean_delta)
+    predicted_plate_delta = ridge.predict(feature_matrix)
+
+    residual_ss = float(np.square(plate_mean_delta - predicted_plate_delta).sum())
+    total_ss = float(np.square(plate_mean_delta - plate_mean_delta.mean(axis=0, keepdims=True)).sum())
+    variance_explained_r2 = float("nan") if total_ss <= 0 else 1.0 - (residual_ss / total_ss)
+
+    drugs_per_plate = (plate_drug_counts > 0).sum(axis=1)
+    summary_df = pd.DataFrame(
+        [
+            {
+                "n_rows": int(len(audit_frame)),
+                "n_plates": int(plate_drug_counts.shape[0]),
+                "n_drugs": int(plate_drug_counts.shape[1]),
+                "mean_drugs_per_plate": float(drugs_per_plate.mean()),
+                "median_drugs_per_plate": float(drugs_per_plate.median()),
+                "ridge_alpha": float(ridge_alpha),
+                "plate_variance_explained_r2": variance_explained_r2,
+            }
+        ]
+    )
+    plate_summary_df = pd.DataFrame(plate_summary_rows).sort_values(
+        ["top_drug_fraction", "n_rows", "plate"],
+        ascending=[False, False, True],
+        ignore_index=True,
+    )
+
+    return {
+        "summary_df": summary_df,
+        "plate_summary_df": plate_summary_df,
+        "plate_drug_fraction_df": plate_drug_fraction_df.reset_index(),
+    }
+
+
 def validate_split_assignments(split_frame, split_mode):
     if split_frame["condition_key"].duplicated().any():
         raise ValueError("condition_key values must remain unique after splitting.")
@@ -672,6 +779,286 @@ def build_prediction_pair_embedding(model, dataset, sampled_prediction_details_d
     predicted_expression_np = predicted_expression.detach().cpu().numpy()
     actual_expression_np = actual_expression.detach().cpu().numpy()
     combined_expression_np = np.concatenate([actual_expression_np, predicted_expression_np], axis=0)
+    embedding_model = PCA(n_components=int(n_components), svd_solver="full")
+    embedded_points = embedding_model.fit_transform(combined_expression_np)
+
+    n_pairs = len(sampled_prediction_details_df)
+    actual_points = embedded_points[:n_pairs]
+    predicted_points = embedded_points[n_pairs:]
+    explained_variance_ratio = embedding_model.explained_variance_ratio_
+
+    plot_rows = []
+    pair_summary_rows = []
+    for row_idx, metadata_row in sampled_prediction_details_df.reset_index(drop=True).iterrows():
+        actual_point = actual_points[row_idx]
+        predicted_point = predicted_points[row_idx]
+        pair_distance_2d = float(np.linalg.norm(actual_point - predicted_point))
+
+        for point_kind, point_values in (("actual", actual_point), ("predicted", predicted_point)):
+            plot_rows.append(
+                {
+                    "pair_index": int(metadata_row["pair_index"]),
+                    "point_kind": point_kind,
+                    "embedding_1": float(point_values[0]),
+                    "embedding_2": float(point_values[1]),
+                    "condition_key": metadata_row["condition_key"],
+                    "cell_line": metadata_row["cell_line"],
+                    "drug": metadata_row["drug"],
+                    "concentration": float(metadata_row["concentration"]),
+                }
+            )
+
+        pair_summary_rows.append(
+            {
+                "pair_index": int(metadata_row["pair_index"]),
+                "condition_key": metadata_row["condition_key"],
+                "cell_line": metadata_row["cell_line"],
+                "drug": metadata_row["drug"],
+                "concentration": float(metadata_row["concentration"]),
+                "concentration_unit": metadata_row["concentration_unit"],
+                "treated_mse": float(metadata_row["treated_mse"]),
+                "delta_mse": float(metadata_row["delta_mse"]),
+                "treated_cosine": float(metadata_row["treated_cosine"]),
+                "mann_whitney_u": float(metadata_row["mann_whitney_u"]),
+                "mann_whitney_pvalue": float(metadata_row["mann_whitney_pvalue"]),
+                "top50_deg_match_count": float(metadata_row["top50_deg_match_count"]),
+                "top50_deg_match_fraction": float(metadata_row["top50_deg_match_fraction"]),
+                "signed_ndcg_at_50": float(metadata_row["signed_ndcg_at_50"]),
+                "pair_distance_2d": pair_distance_2d,
+            }
+        )
+
+    plot_df = pd.DataFrame(plot_rows)
+    pair_summary_df = pd.DataFrame(pair_summary_rows).sort_values(
+        ["pair_distance_2d", "treated_mse"],
+        ascending=[False, False],
+        ignore_index=True,
+    )
+    return plot_df, pair_summary_df, explained_variance_ratio
+
+
+def build_rf_training_arrays(preprocessor, examples_df):
+    required_columns = ("baseline_index", "fingerprint_index", "target_index", "concentration")
+    missing_columns = [column for column in required_columns if column not in examples_df.columns]
+    if missing_columns:
+        raise ValueError(f"examples_df is missing required columns for RF array assembly: {missing_columns}")
+
+    baseline_indices = torch.as_tensor(examples_df["baseline_index"].to_numpy(np.int64), dtype=torch.long)
+    fingerprint_indices = torch.as_tensor(examples_df["fingerprint_index"].to_numpy(np.int64), dtype=torch.long)
+    target_indices = torch.as_tensor(examples_df["target_index"].to_numpy(np.int64), dtype=torch.long)
+
+    baseline_tensor = preprocessor.dmso_target_expression_lookup.index_select(0, baseline_indices).contiguous()
+    fingerprint_tensor = preprocessor.fingerprint_lookup.index_select(0, fingerprint_indices).contiguous()
+    target_tensor = preprocessor.treatment_expression_lookup.index_select(0, target_indices).contiguous()
+
+    concentration_values = examples_df["concentration"].to_numpy(np.float32)
+    log_concentration_values = np.log10(np.clip(concentration_values, a_min=MIN_STANDARD_DEVIATION, a_max=None))
+    scaled_dose_values = (
+        (log_concentration_values - float(preprocessor.dose_log_mean.item()))
+        / float(preprocessor.dose_log_std.item())
+    ).astype(np.float32)
+
+    baseline_np = baseline_tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+    fingerprint_np = fingerprint_tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+    target_np = target_tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    input_features_np = np.concatenate(
+        [baseline_np, fingerprint_np, scaled_dose_values.reshape(-1, 1)],
+        axis=1,
+    )
+    target_delta_np = target_np - baseline_np
+    return input_features_np, target_delta_np, baseline_np
+
+
+def _compute_sklearn_per_sample_metrics(predicted_delta_np, target_delta_np, baseline_np, deg_top_k):
+    predicted_delta_tensor = torch.as_tensor(predicted_delta_np, dtype=torch.float32)
+    target_delta_tensor = torch.as_tensor(target_delta_np, dtype=torch.float32)
+    baseline_tensor = torch.as_tensor(baseline_np, dtype=torch.float32)
+
+    predicted_expression = baseline_tensor + predicted_delta_tensor
+    target_expression = baseline_tensor + target_delta_tensor
+
+    per_sample_delta_mse = torch.mean((predicted_delta_tensor - target_delta_tensor) ** 2, dim=1).numpy().astype(np.float64)
+    per_sample_delta_mae = torch.mean(torch.abs(predicted_delta_tensor - target_delta_tensor), dim=1).numpy().astype(np.float64)
+    per_sample_treated_mse = torch.mean((predicted_expression - target_expression) ** 2, dim=1).numpy().astype(np.float64)
+    per_sample_treated_cosine = F.cosine_similarity(predicted_expression, target_expression, dim=1).numpy().astype(np.float64)
+
+    per_sample_mann_whitney_u, per_sample_mann_whitney_pvalue = compute_mann_whitney_batch(
+        predicted_expression,
+        target_expression,
+    )
+    (
+        per_sample_top50_deg_match_count,
+        per_sample_top50_deg_match_fraction,
+        per_sample_signed_ndcg_at_50,
+    ) = compute_topk_deg_metrics_batch(
+        predicted_delta_tensor,
+        target_delta_tensor,
+        top_k=deg_top_k,
+    )
+
+    return {
+        "predicted_expression": predicted_expression,
+        "target_expression": target_expression,
+        "delta_mse": per_sample_delta_mse,
+        "delta_mae": per_sample_delta_mae,
+        "treated_mse": per_sample_treated_mse,
+        "treated_cosine": per_sample_treated_cosine,
+        "mann_whitney_u": per_sample_mann_whitney_u,
+        "mann_whitney_pvalue": per_sample_mann_whitney_pvalue,
+        "top50_deg_match_count": per_sample_top50_deg_match_count,
+        "top50_deg_match_fraction": per_sample_top50_deg_match_fraction,
+        "signed_ndcg_at_50": per_sample_signed_ndcg_at_50,
+    }
+
+
+def evaluate_sklearn_predictions(
+    predicted_delta_np,
+    target_delta_np,
+    baseline_np,
+    metadata_df,
+    split_name,
+    gene_ids,
+    max_inspection_rows=3,
+    n_inspection_genes=5,
+    mann_whitney_alpha=0.05,
+    deg_top_k=50,
+):
+    if predicted_delta_np.shape != target_delta_np.shape:
+        raise ValueError(
+            f"predicted_delta_np shape {predicted_delta_np.shape} does not match target_delta_np shape {target_delta_np.shape}."
+        )
+    if baseline_np.shape != target_delta_np.shape:
+        raise ValueError(
+            f"baseline_np shape {baseline_np.shape} does not match target_delta_np shape {target_delta_np.shape}."
+        )
+    if len(metadata_df) != predicted_delta_np.shape[0]:
+        raise ValueError(
+            f"metadata_df has {len(metadata_df)} rows but predicted_delta_np has {predicted_delta_np.shape[0]} rows."
+        )
+
+    required_metadata_columns = (
+        "condition_key",
+        "cell_line",
+        "cell_name",
+        "organ",
+        "drug",
+        "concentration",
+        "concentration_unit",
+    )
+    missing_metadata_columns = [column for column in required_metadata_columns if column not in metadata_df.columns]
+    if missing_metadata_columns:
+        raise ValueError(f"metadata_df is missing required columns: {missing_metadata_columns}")
+
+    metadata_df = metadata_df.reset_index(drop=True)
+    selected_gene_ids = list(gene_ids[:n_inspection_genes])
+
+    per_sample = _compute_sklearn_per_sample_metrics(
+        predicted_delta_np=predicted_delta_np,
+        target_delta_np=target_delta_np,
+        baseline_np=baseline_np,
+        deg_top_k=deg_top_k,
+    )
+    predicted_expression_tensor = per_sample["predicted_expression"]
+    target_expression_tensor = per_sample["target_expression"]
+    total_rows = int(predicted_delta_np.shape[0])
+
+    inspection_rows = []
+    inspection_limit = min(max_inspection_rows, total_rows)
+    for row_idx in range(inspection_limit):
+        inspection_row = {
+            "split": split_name,
+            "condition_key": metadata_df.at[row_idx, "condition_key"],
+            "cell_line": metadata_df.at[row_idx, "cell_line"],
+            "drug": metadata_df.at[row_idx, "drug"],
+            "concentration": float(metadata_df.at[row_idx, "concentration"]),
+            "sample_delta_mse": float(per_sample["delta_mse"][row_idx]),
+            "sample_treated_cosine": float(per_sample["treated_cosine"][row_idx]),
+            "sample_mann_whitney_u": float(per_sample["mann_whitney_u"][row_idx]),
+            "sample_mann_whitney_pvalue": float(per_sample["mann_whitney_pvalue"][row_idx]),
+            "sample_top50_deg_match_count": float(per_sample["top50_deg_match_count"][row_idx]),
+            "sample_top50_deg_match_fraction": float(per_sample["top50_deg_match_fraction"][row_idx]),
+            "sample_signed_ndcg_at_50": float(per_sample["signed_ndcg_at_50"][row_idx]),
+        }
+        for gene_offset, gene_id in enumerate(selected_gene_ids):
+            inspection_row[f"pred_{gene_id}"] = float(predicted_expression_tensor[row_idx, gene_offset].item())
+            inspection_row[f"target_{gene_id}"] = float(target_expression_tensor[row_idx, gene_offset].item())
+        inspection_rows.append(inspection_row)
+
+    prediction_detail_rows = []
+    for row_idx in range(total_rows):
+        prediction_detail_rows.append(
+            {
+                "split": split_name,
+                "dataset_index": int(row_idx),
+                "condition_key": metadata_df.at[row_idx, "condition_key"],
+                "cell_line": metadata_df.at[row_idx, "cell_line"],
+                "cell_name": metadata_df.at[row_idx, "cell_name"],
+                "organ": metadata_df.at[row_idx, "organ"],
+                "drug": metadata_df.at[row_idx, "drug"],
+                "concentration": float(metadata_df.at[row_idx, "concentration"]),
+                "concentration_unit": metadata_df.at[row_idx, "concentration_unit"],
+                "delta_mse": float(per_sample["delta_mse"][row_idx]),
+                "delta_mae": float(per_sample["delta_mae"][row_idx]),
+                "treated_mse": float(per_sample["treated_mse"][row_idx]),
+                "treated_cosine": float(per_sample["treated_cosine"][row_idx]),
+                "mann_whitney_u": float(per_sample["mann_whitney_u"][row_idx]),
+                "mann_whitney_pvalue": float(per_sample["mann_whitney_pvalue"][row_idx]),
+                "top50_deg_match_count": float(per_sample["top50_deg_match_count"][row_idx]),
+                "top50_deg_match_fraction": float(per_sample["top50_deg_match_fraction"][row_idx]),
+                "signed_ndcg_at_50": float(per_sample["signed_ndcg_at_50"][row_idx]),
+            }
+        )
+
+    metrics = {
+        "split": split_name,
+        "n_samples": total_rows,
+        "delta_mse": float(per_sample["delta_mse"].mean()) if total_rows else float("nan"),
+        "delta_mae": float(per_sample["delta_mae"].mean()) if total_rows else float("nan"),
+        "treated_cosine": float(per_sample["treated_cosine"].mean()) if total_rows else float("nan"),
+        "mann_whitney_u_median": float(np.median(per_sample["mann_whitney_u"])) if total_rows else float("nan"),
+        "mann_whitney_pvalue_mean": float(np.mean(per_sample["mann_whitney_pvalue"])) if total_rows else float("nan"),
+        "mann_whitney_pvalue_median": float(np.median(per_sample["mann_whitney_pvalue"])) if total_rows else float("nan"),
+        "mann_whitney_not_significant_fraction": float(np.mean(per_sample["mann_whitney_pvalue"] >= mann_whitney_alpha)) if total_rows else float("nan"),
+        "top50_deg_match_count_mean": float(np.mean(per_sample["top50_deg_match_count"])) if total_rows else float("nan"),
+        "top50_deg_match_count_median": float(np.median(per_sample["top50_deg_match_count"])) if total_rows else float("nan"),
+        "top50_deg_match_fraction_mean": float(np.mean(per_sample["top50_deg_match_fraction"])) if total_rows else float("nan"),
+        "top50_deg_match_fraction_median": float(np.median(per_sample["top50_deg_match_fraction"])) if total_rows else float("nan"),
+        "signed_ndcg_at_50_mean": float(np.mean(per_sample["signed_ndcg_at_50"])) if total_rows else float("nan"),
+        "signed_ndcg_at_50_median": float(np.median(per_sample["signed_ndcg_at_50"])) if total_rows else float("nan"),
+    }
+    inspection_df = pd.DataFrame(inspection_rows)
+    prediction_details_df = pd.DataFrame(prediction_detail_rows)
+    return metrics, inspection_df, prediction_details_df
+
+
+def build_sklearn_prediction_pair_embedding(
+    sampled_prediction_details_df,
+    baseline_np,
+    predicted_delta_np,
+    target_delta_np,
+    embedding_method,
+    n_components,
+):
+    if embedding_method != "pca":
+        raise ValueError(f"Unsupported embedding method: {embedding_method}")
+    if sampled_prediction_details_df.empty:
+        raise ValueError("No sampled prediction details were provided for embedding.")
+    if baseline_np.shape != predicted_delta_np.shape or baseline_np.shape != target_delta_np.shape:
+        raise ValueError("baseline_np, predicted_delta_np, and target_delta_np must share the same shape.")
+
+    dataset_indices = sampled_prediction_details_df["dataset_index"].to_numpy(np.int64)
+    if dataset_indices.min() < 0 or dataset_indices.max() >= baseline_np.shape[0]:
+        raise ValueError("sampled_prediction_details_df dataset_index values fall outside the precomputed split arrays.")
+
+    selected_baseline = baseline_np[dataset_indices]
+    selected_predicted_delta = predicted_delta_np[dataset_indices]
+    selected_target_delta = target_delta_np[dataset_indices]
+
+    actual_expression_np = selected_baseline + selected_target_delta
+    predicted_expression_np = selected_baseline + selected_predicted_delta
+    combined_expression_np = np.concatenate([actual_expression_np, predicted_expression_np], axis=0)
+
     embedding_model = PCA(n_components=int(n_components), svd_solver="full")
     embedded_points = embedding_model.fit_transform(combined_expression_np)
 

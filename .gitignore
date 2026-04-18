@@ -1,118 +1,95 @@
-data/Tahoe100M_Pseudobulk_processed/CVCL_0023.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0028.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0069.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0099.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0131.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0152.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0179.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0218.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0292.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0293.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0320.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0332.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0334.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0359.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0366.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0371.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0397.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0399.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0428.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0459.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0480.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0504.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_0546.h5ad
-data/Tahoe100M_Pseudobulk_processed/CVCL_1055.h5ad
-data/Tahoe100M_Pseudobulk_processed/processed_file_manifest.csv
+# ---------------------------------------------------------------------------
+# OS / editor cruft
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ---------------------------------------------------------------------------
+# Large data artifacts (raw + intermediate tensors)
+# ---------------------------------------------------------------------------
+# Pseudobulk h5ad collections (multi-GB)
+data/Tahoe100M_Pseudobulk_processed/
+
+# Tensor artifact directories (any Tahoe100M tensor bundle, L1000 / plate / etc.)
+data/Tahoe100M_tensor_artifacts*/
+
+# Misc large/reference data files
 data/Morganfingerprints.csv
-data/Tahoe100M_tensor_artifacts/dmso_baselines.pt
-data/Tahoe100M_tensor_artifacts/dropped_missing_fingerprint_profiles.csv
-data/Tahoe100M_tensor_artifacts/morgan_fingerprints.pt
-data/Tahoe100M_tensor_artifacts/repeated_condition_counts.csv
-data/Tahoe100M_tensor_artifacts/treatment_expressions.pt
-data/Tahoe100M_tensor_artifacts/zero_expression_dmso_profiles.csv
-data/Tahoe100M_tensor_artifacts/zero_expression_source_profiles.csv
-data/Tahoe100M_tensor_artifacts/zero_expression_treatment_profiles.csv
-artifacts/lightning/linear_regression/mixed_ridge_compressed_delta/version_0/hparams.yaml
-artifacts/lightning/linear_regression/mixed_ridge_compressed_delta/version_0/metrics.csv
-artifacts/lightning/linear_regression_plot_smoke/mixed_ridge_compressed_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=263.028259.ckpt
-artifacts/lightning/linear_regression_plot_smoke/mixed_ridge_compressed_delta/version_0/hparams.yaml
-artifacts/lightning/linear_regression_plot_smoke/mixed_ridge_compressed_delta/version_0/metrics.csv
-artifacts/lightning/linear_regression_plot_smoke_agg/mixed_ridge_compressed_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=266.994568.ckpt
-artifacts/lightning/linear_regression_plot_smoke_agg/mixed_ridge_compressed_delta/version_0/hparams.yaml
-artifacts/lightning/linear_regression_plot_smoke_agg/mixed_ridge_compressed_delta/version_0/metrics.csv
-artifacts/lightning/linear_regression_smoke/mixed_ridge_compressed_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=262.906464.ckpt
-artifacts/lightning/linear_regression_smoke/mixed_ridge_compressed_delta/version_0/hparams.yaml
-artifacts/lightning/linear_regression_smoke/mixed_ridge_compressed_delta/version_0/metrics.csv
-artifacts/lightning/linear_regression/mixed_ridge_compressed_delta/checkpoints/epoch=epoch=14-val_loss=val_loss=227.125824.ckpt
-artifacts/lightning/linear_regression/mixed_ridge_full_delta/checkpoints/epoch=epoch=03-val_loss=val_loss=634.005005.ckpt
-artifacts/lightning/linear_regression/mixed_ridge_full_delta/version_0/hparams.yaml
-artifacts/lightning/linear_regression/mixed_ridge_full_delta/version_0/metrics.csv
-artifacts/lightning/linear_regression/mixed_ridge_full_delta/version_1/hparams.yaml
-artifacts/lightning/linear_regression/mixed_ridge_full_delta/version_1/metrics.csv
-artifacts/lightning/linear_regression/mixed_ridge_full_delta/version_2/hparams.yaml
-artifacts/lightning/linear_regression/mixed_ridge_full_delta/version_2/metrics.csv
 data/geneinfo_beta.txt
 data/landmark_genes.csv
-data/Tahoe100M_tensor_artifacts_L1000/dmso_baselines.pt
-data/Tahoe100M_tensor_artifacts_L1000/dropped_missing_fingerprint_profiles.csv
-data/Tahoe100M_tensor_artifacts_L1000/morgan_fingerprints.pt
-data/Tahoe100M_tensor_artifacts_L1000/repeated_condition_counts.csv
-data/Tahoe100M_tensor_artifacts_L1000/treatment_expressions.pt
-data/Tahoe100M_tensor_artifacts_L1000/zero_expression_dmso_profiles.csv
-data/Tahoe100M_tensor_artifacts_L1000/zero_expression_source_profiles.csv
-data/Tahoe100M_tensor_artifacts_L1000/zero_expression_treatment_profiles.csv
-artifacts/lightning/l1000_smoke/mixed_ridge_full_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=805.189819.ckpt
-artifacts/lightning/l1000_smoke/mixed_ridge_full_delta/version_0/hparams.yaml
-artifacts/lightning/l1000_smoke/mixed_ridge_full_delta/version_0/metrics.csv
-artifacts/lightning/linear_regression/mixed_ridge_compressed_delta/checkpoints/epoch=epoch=14-val_loss=val_loss=226.527206.ckpt
-artifacts/lightning/linear_regression/mixed_ridge_compressed_delta/version_1/hparams.yaml
-artifacts/lightning/linear_regression/mixed_ridge_compressed_delta/version_1/metrics.csv
-artifacts/lightning/linear_regression/mixed_ridge_full_delta/checkpoints/epoch=epoch=02-val_loss=val_loss=233.915878.ckpt
-artifacts/lightning/linear_regression/mixed_ridge_full_delta/checkpoints/epoch=epoch=03-val_loss=val_loss=230.615662.ckpt
-artifacts/lightning/linear_regression/mixed_ridge_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=794.944580.ckpt
-artifacts/lightning/linear_regression/mixed_ridge_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=798.851501.ckpt
-artifacts/lightning/linear_regression/mixed_ridge_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=803.257874.ckpt
-artifacts/lightning/linear_regression/mixed_ridge_delta/checkpoints/epoch=epoch=03-val_loss=val_loss=632.966003.ckpt
-artifacts/lightning/linear_regression/mixed_ridge_delta/checkpoints/epoch=epoch=03-val_loss=val_loss=637.142273.ckpt
-artifacts/lightning/linear_regression/mixed_ridge_delta/version_0/hparams.yaml
-artifacts/lightning/linear_regression/mixed_ridge_delta/version_0/metrics.csv
-artifacts/lightning/linear_regression/mixed_ridge_delta/version_1/hparams.yaml
-artifacts/lightning/linear_regression/mixed_ridge_delta/version_1/metrics.csv
-artifacts/lightning/linear_regression/mixed_ridge_delta/version_2/hparams.yaml
-artifacts/lightning/linear_regression/mixed_ridge_delta/version_2/metrics.csv
-artifacts/lightning/linear_regression/mixed_ridge_delta/version_3/hparams.yaml
-artifacts/lightning/linear_regression/mixed_ridge_delta/version_3/metrics.csv
-artifacts/lightning/linear_regression/mixed_ridge_delta/version_4/hparams.yaml
-artifacts/lightning/linear_regression/mixed_ridge_delta/version_4/metrics.csv
-__pycache__/
-artifacts/lightning/linear_regression/mixed_ridge_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=795.340759.ckpt
-artifacts/lightning/linear_regression/mixed_ridge_delta/checkpoints/epoch=epoch=03-val_loss=val_loss=641.960266.ckpt
-artifacts/lightning/linear_regression/mixed_ridge_delta/version_5/hparams.yaml
-artifacts/lightning/linear_regression/mixed_ridge_delta/version_5/metrics.csv
-artifacts/lightning/linear_regression/mixed_ridge_delta/version_6/hparams.yaml
-artifacts/lightning/linear_regression/mixed_ridge_delta/version_6/metrics.csv
-artifacts/lightning/linear_regression/mixed_mlp_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=741.152893.ckpt
-artifacts/lightning/linear_regression/mixed_mlp_delta/checkpoints/epoch=epoch=16-val_loss=val_loss=489.628082.ckpt
-artifacts/lightning/linear_regression/mixed_mlp_delta/version_0/hparams.yaml
-artifacts/lightning/linear_regression/mixed_mlp_delta/version_0/metrics.csv
-artifacts/lightning/linear_regression/mixed_mlp_delta/version_1/hparams.yaml
-artifacts/lightning/linear_regression/mixed_mlp_delta/version_1/metrics.csv
-artifacts/lightning/linear_regression/mixed_ridge_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=781.801575.ckpt
-artifacts/lightning/linear_regression/mixed_ridge_delta/version_7/hparams.yaml
-artifacts/lightning/linear_regression/mixed_ridge_delta/version_7/metrics.csv
-artifacts/lightning/linear_regression/drug_blind_mlp_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=594.855835.ckpt
-artifacts/lightning/linear_regression/drug_blind_mlp_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=3180.555664.ckpt
-artifacts/lightning/linear_regression/drug_blind_mlp_delta/checkpoints/epoch=epoch=01-val_loss=val_loss=594.130615.ckpt
-artifacts/lightning/linear_regression/drug_blind_mlp_delta/version_0/hparams.yaml
-artifacts/lightning/linear_regression/drug_blind_mlp_delta/version_0/metrics.csv
-artifacts/lightning/linear_regression/drug_blind_mlp_delta/version_1/hparams.yaml
-artifacts/lightning/linear_regression/drug_blind_mlp_delta/version_1/metrics.csv
-artifacts/lightning/linear_regression/drug_blind_mlp_delta/version_2/hparams.yaml
-artifacts/lightning/linear_regression/drug_blind_mlp_delta/version_2/metrics.csv
-artifacts/lightning/linear_regression/drug_blind_ridge_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=27885.990234.ckpt
-artifacts/lightning/linear_regression/drug_blind_ridge_delta/version_0/hparams.yaml
-artifacts/lightning/linear_regression/drug_blind_ridge_delta/version_0/metrics.csv
 
-# Ignore all Lightning checkpoint files (too large for GitHub)
+# Catch-all for common large binary formats anywhere in the repo
+*.h5ad
+*.h5
+*.hdf5
+*.parquet
+*.feather
+*.arrow
+*.npy
+*.npz
+*.pt
+*.pth
+*.safetensors
+
+# ---------------------------------------------------------------------------
+# Model training artifacts / checkpoints
+# ---------------------------------------------------------------------------
+# Everything under artifacts/ (Lightning logs, checkpoints, sklearn joblibs, etc.)
+artifacts/
+
+# Safety net for model files outside artifacts/
 *.ckpt
-artifacts/lightning/linear_regression/drug_blind_mlp_delta/checkpoints/epoch=epoch=00-val_loss=val_loss=592.867981.ckpt
+*.joblib
+*.pkl
+*.pickle
+
+# Lightning / TensorBoard run directories
+lightning_logs/
+tb_logs/
+wandb/
+mlruns/
+
+# ---------------------------------------------------------------------------
+# Hydra / run outputs
+# ---------------------------------------------------------------------------
+outputs/*/
+!outputs/*.txt
+!outputs/*.jsonl
+multirun/
+
+# ---------------------------------------------------------------------------
+# Keep tracked exceptions
+# ---------------------------------------------------------------------------
+# The two small pseudobulk samples that are already tracked stay tracked via
+# git's existing index; if you want to re-add them after the *.h5ad rule,
+# use `git add -f <path>`.

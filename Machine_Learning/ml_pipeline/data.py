@@ -157,7 +157,14 @@ class TrainingPreprocessor:
 
 
 class PreparedTreatmentDataset(Dataset):
-    def __init__(self, examples_df, preprocessor):
+    def __init__(
+        self,
+        examples_df,
+        preprocessor,
+        cell_line_to_index=None,
+        confounder_column=None,
+        confounder_to_index=None,
+    ):
         self.examples_df = examples_df.reset_index(drop=True).copy()
         self.preprocessor = preprocessor
         self.condition_keys = self.examples_df["condition_key"].tolist()
@@ -187,6 +194,52 @@ class PreparedTreatmentDataset(Dataset):
             dtype=torch.long,
         )
 
+        self.cell_line_to_index = dict(cell_line_to_index) if cell_line_to_index is not None else None
+        if self.cell_line_to_index is not None:
+            unmapped_cell_lines = sorted({cl for cl in self.cell_lines if cl not in self.cell_line_to_index})
+            if unmapped_cell_lines:
+                raise KeyError(
+                    f"cell_line_to_index is missing entries for {len(unmapped_cell_lines)} cell line(s): "
+                    f"{unmapped_cell_lines[:5]}"
+                )
+            self.cell_line_indices = torch.tensor(
+                [int(self.cell_line_to_index[cl]) for cl in self.cell_lines],
+                dtype=torch.long,
+            )
+        else:
+            self.cell_line_indices = None
+
+        if (confounder_column is None) != (confounder_to_index is None):
+            raise ValueError(
+                "confounder_column and confounder_to_index must be provided together."
+            )
+        if confounder_column is None and confounder_to_index is None and self.cell_line_to_index is not None:
+            confounder_column = "cell_line"
+            confounder_to_index = self.cell_line_to_index
+
+        self.confounder_column = str(confounder_column) if confounder_column is not None else None
+        self.confounder_to_index = dict(confounder_to_index) if confounder_to_index is not None else None
+        if self.confounder_to_index is not None:
+            if self.confounder_column not in self.examples_df.columns:
+                raise KeyError(
+                    f"examples_df is missing the confounder column '{self.confounder_column}'."
+                )
+            confounder_values = self.examples_df[self.confounder_column].tolist()
+            unmapped_confounders = sorted({v for v in confounder_values if v not in self.confounder_to_index})
+            if unmapped_confounders:
+                raise KeyError(
+                    f"confounder_to_index is missing entries for {len(unmapped_confounders)} "
+                    f"'{self.confounder_column}' value(s): {unmapped_confounders[:5]}"
+                )
+            self.confounder_values = confounder_values
+            self.confounder_indices = torch.tensor(
+                [int(self.confounder_to_index[v]) for v in confounder_values],
+                dtype=torch.long,
+            )
+        else:
+            self.confounder_values = None
+            self.confounder_indices = None
+
     def __len__(self):
         return len(self.examples_df)
 
@@ -206,7 +259,7 @@ class PreparedTreatmentDataset(Dataset):
             dim=0,
         )
 
-        return {
+        item = {
             "dataset_index": int(idx),
             "input_features": input_features,
             "gene_features": gene_features,
@@ -222,6 +275,11 @@ class PreparedTreatmentDataset(Dataset):
             "drug": self.drugs[idx],
             "concentration_unit": self.concentration_units[idx],
         }
+        if self.cell_line_indices is not None:
+            item["cell_line_index"] = self.cell_line_indices[idx]
+        if self.confounder_indices is not None:
+            item["confounder_index"] = self.confounder_indices[idx]
+        return item
 
 
 class DrugResponseDataModule(L.LightningDataModule):
@@ -234,6 +292,9 @@ class DrugResponseDataModule(L.LightningDataModule):
         batch_size,
         num_workers,
         seed,
+        cell_line_to_index=None,
+        confounder_column=None,
+        confounder_to_index=None,
     ):
         super().__init__()
         self.train_examples_df = train_examples_df.reset_index(drop=True).copy()
@@ -243,18 +304,34 @@ class DrugResponseDataModule(L.LightningDataModule):
         self.batch_size = int(batch_size)
         self.num_workers = int(num_workers)
         self.seed = int(seed)
+        self.cell_line_to_index = dict(cell_line_to_index) if cell_line_to_index is not None else None
+        if (confounder_column is None) != (confounder_to_index is None):
+            raise ValueError(
+                "confounder_column and confounder_to_index must be provided together."
+            )
+        self.confounder_column = str(confounder_column) if confounder_column is not None else None
+        self.confounder_to_index = dict(confounder_to_index) if confounder_to_index is not None else None
         self.pin_memory = bool(torch.cuda.is_available())
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
 
+    def _make_prepared_dataset(self, examples_df):
+        return PreparedTreatmentDataset(
+            examples_df,
+            self.preprocessor,
+            cell_line_to_index=self.cell_line_to_index,
+            confounder_column=self.confounder_column,
+            confounder_to_index=self.confounder_to_index,
+        )
+
     def setup(self, stage=None):
         if self.train_dataset is None:
-            self.train_dataset = PreparedTreatmentDataset(self.train_examples_df, self.preprocessor)
+            self.train_dataset = self._make_prepared_dataset(self.train_examples_df)
         if self.val_dataset is None:
-            self.val_dataset = PreparedTreatmentDataset(self.val_examples_df, self.preprocessor)
+            self.val_dataset = self._make_prepared_dataset(self.val_examples_df)
         if self.test_dataset is None:
-            self.test_dataset = PreparedTreatmentDataset(self.test_examples_df, self.preprocessor)
+            self.test_dataset = self._make_prepared_dataset(self.test_examples_df)
 
     def _make_loader(self, dataset, shuffle):
         loader_kwargs = {
