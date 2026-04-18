@@ -8,6 +8,16 @@ def _as_tuple(hidden_dims):
     return tuple(int(hidden_dim) for hidden_dim in hidden_dims)
 
 
+def _per_sample_pearson(predicted, target, eps=1e-12):
+    predicted_centered = predicted - predicted.mean(dim=1, keepdim=True)
+    target_centered = target - target.mean(dim=1, keepdim=True)
+    numerator = (predicted_centered * target_centered).sum(dim=1)
+    denominator = torch.sqrt(
+        (predicted_centered ** 2).sum(dim=1) * (target_centered ** 2).sum(dim=1)
+    ).clamp_min(eps)
+    return numerator / denominator
+
+
 def _build_mlp(input_dim, hidden_dims, output_dim, activation_cls=nn.ReLU):
     layers = []
     previous_dim = int(input_dim)
@@ -127,11 +137,17 @@ class BaseDrugResponseModule(L.LightningModule):
         loss = F.mse_loss(predicted_delta, target_delta)
         delta_mae = F.l1_loss(predicted_delta, target_delta)
         treated_cosine = F.cosine_similarity(predicted_expression, target_expression, dim=1).mean()
+        delta_cosine = F.cosine_similarity(predicted_delta, target_delta, dim=1).mean()
+        delta_pearson = _per_sample_pearson(predicted_delta, target_delta).mean()
 
-        self.log(f"{stage}_loss", loss, on_step=False, on_epoch=True, prog_bar=stage != "train", batch_size=target_delta.shape[0])
-        self.log(f"{stage}_delta_mse", loss, on_step=False, on_epoch=True, batch_size=target_delta.shape[0])
-        self.log(f"{stage}_delta_mae", delta_mae, on_step=False, on_epoch=True, batch_size=target_delta.shape[0])
-        self.log(f"{stage}_treated_cosine", treated_cosine, on_step=False, on_epoch=True, prog_bar=stage != "train", batch_size=target_delta.shape[0])
+        prog_bar_stage = stage != "train"
+        batch_size = target_delta.shape[0]
+        self.log(f"{stage}_loss", loss, on_step=False, on_epoch=True, prog_bar=prog_bar_stage, batch_size=batch_size)
+        self.log(f"{stage}_delta_mse", loss, on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log(f"{stage}_delta_mae", delta_mae, on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log(f"{stage}_treated_cosine", treated_cosine, on_step=False, on_epoch=True, prog_bar=prog_bar_stage, batch_size=batch_size)
+        self.log(f"{stage}_delta_cosine", delta_cosine, on_step=False, on_epoch=True, prog_bar=prog_bar_stage, batch_size=batch_size)
+        self.log(f"{stage}_delta_pearson", delta_pearson, on_step=False, on_epoch=True, prog_bar=prog_bar_stage, batch_size=batch_size)
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -500,6 +516,8 @@ class ADAEDrugResponseModule(BaseDrugResponseModule):
         delta_mse = F.mse_loss(predicted_delta, target_delta)
         delta_mae = F.l1_loss(predicted_delta, target_delta)
         treated_cosine = F.cosine_similarity(predicted_expression, target_expression, dim=1).mean()
+        delta_cosine = F.cosine_similarity(predicted_delta, target_delta, dim=1).mean()
+        delta_pearson = _per_sample_pearson(predicted_delta, target_delta).mean()
 
         batch_size = int(target_delta.shape[0])
         prog_bar = stage != "train"
@@ -519,6 +537,22 @@ class ADAEDrugResponseModule(BaseDrugResponseModule):
         self.log(
             f"{stage}_treated_cosine",
             treated_cosine,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=prog_bar,
+            batch_size=batch_size,
+        )
+        self.log(
+            f"{stage}_delta_cosine",
+            delta_cosine,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=prog_bar,
+            batch_size=batch_size,
+        )
+        self.log(
+            f"{stage}_delta_pearson",
+            delta_pearson,
             on_step=False,
             on_epoch=True,
             prog_bar=prog_bar,

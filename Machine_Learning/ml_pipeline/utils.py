@@ -1,3 +1,4 @@
+import json
 import math
 from pathlib import Path
 
@@ -5,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.ipc as ipc
-from scipy.stats import mannwhitneyu
+from scipy.stats import mannwhitneyu, rankdata
 import torch
 import torch.nn.functional as F
 from sklearn.decomposition import PCA
@@ -560,6 +561,59 @@ def compute_topk_deg_metrics_batch(predicted_delta, target_delta, top_k=50):
     )
 
 
+def _per_sample_delta_metrics(predicted_delta, target_delta, eps=1e-12):
+    predicted_delta_np = np.asarray(predicted_delta, dtype=np.float64)
+    target_delta_np = np.asarray(target_delta, dtype=np.float64)
+
+    if predicted_delta_np.shape != target_delta_np.shape:
+        raise ValueError(
+            f"predicted_delta shape {predicted_delta_np.shape} does not match "
+            f"target_delta shape {target_delta_np.shape}."
+        )
+
+    if predicted_delta_np.ndim != 2:
+        raise ValueError("predicted_delta and target_delta must be 2D (n_samples, n_genes).")
+
+    predicted_norm = np.linalg.norm(predicted_delta_np, axis=1)
+    target_norm = np.linalg.norm(target_delta_np, axis=1)
+    dot_product = np.einsum("ij,ij->i", predicted_delta_np, target_delta_np)
+    cosine_denominator = np.maximum(predicted_norm * target_norm, eps)
+    delta_cosine = dot_product / cosine_denominator
+
+    predicted_centered = predicted_delta_np - predicted_delta_np.mean(axis=1, keepdims=True)
+    target_centered = target_delta_np - target_delta_np.mean(axis=1, keepdims=True)
+    numerator = np.einsum("ij,ij->i", predicted_centered, target_centered)
+    pearson_denominator = np.sqrt(
+        (predicted_centered ** 2).sum(axis=1) * (target_centered ** 2).sum(axis=1)
+    )
+    delta_pearson = numerator / np.maximum(pearson_denominator, eps)
+
+    # Row-wise Spearman = Pearson on ranks; rankdata handles ties by average rank.
+    predicted_ranks = np.apply_along_axis(rankdata, 1, predicted_delta_np)
+    target_ranks = np.apply_along_axis(rankdata, 1, target_delta_np)
+    predicted_ranks_centered = predicted_ranks - predicted_ranks.mean(axis=1, keepdims=True)
+    target_ranks_centered = target_ranks - target_ranks.mean(axis=1, keepdims=True)
+    spearman_numerator = np.einsum("ij,ij->i", predicted_ranks_centered, target_ranks_centered)
+    spearman_denominator = np.sqrt(
+        (predicted_ranks_centered ** 2).sum(axis=1) * (target_ranks_centered ** 2).sum(axis=1)
+    )
+    delta_spearman = spearman_numerator / np.maximum(spearman_denominator, eps)
+
+    residual_ss = np.square(predicted_delta_np - target_delta_np).sum(axis=1)
+    target_ss = np.square(target_delta_np).sum(axis=1)
+    delta_r2_vs_zero = 1.0 - residual_ss / np.maximum(target_ss, eps)
+
+    magnitude_ratio = predicted_norm / np.maximum(target_norm, eps)
+
+    return {
+        "delta_cosine": delta_cosine.astype(np.float64, copy=False),
+        "delta_pearson": delta_pearson.astype(np.float64, copy=False),
+        "delta_spearman": delta_spearman.astype(np.float64, copy=False),
+        "delta_r2_vs_zero": delta_r2_vs_zero.astype(np.float64, copy=False),
+        "magnitude_ratio": magnitude_ratio.astype(np.float64, copy=False),
+    }
+
+
 def evaluate_model_on_loader(
     model,
     loader,
@@ -581,6 +635,11 @@ def evaluate_model_on_loader(
     top50_deg_match_counts = []
     top50_deg_match_fractions = []
     signed_ndcg_at_50_values = []
+    delta_cosine_values = []
+    delta_pearson_values = []
+    delta_spearman_values = []
+    delta_r2_vs_zero_values = []
+    magnitude_ratio_values = []
     inspection_rows = []
     prediction_detail_rows = []
 
@@ -611,6 +670,16 @@ def evaluate_model_on_loader(
                 top_k=deg_top_k,
             )
 
+            per_sample_delta_metric_arrays = _per_sample_delta_metrics(
+                predicted_delta.detach().cpu().numpy(),
+                target_delta.detach().cpu().numpy(),
+            )
+            per_sample_delta_cosine = per_sample_delta_metric_arrays["delta_cosine"]
+            per_sample_delta_pearson = per_sample_delta_metric_arrays["delta_pearson"]
+            per_sample_delta_spearman = per_sample_delta_metric_arrays["delta_spearman"]
+            per_sample_delta_r2_vs_zero = per_sample_delta_metric_arrays["delta_r2_vs_zero"]
+            per_sample_magnitude_ratio = per_sample_delta_metric_arrays["magnitude_ratio"]
+
             batch_rows = int(target_delta.shape[0])
             total_rows += batch_rows
             delta_mse_sum += float(per_sample_delta_mse.sum().item())
@@ -621,6 +690,11 @@ def evaluate_model_on_loader(
             top50_deg_match_counts.extend(per_sample_top50_deg_match_count.tolist())
             top50_deg_match_fractions.extend(per_sample_top50_deg_match_fraction.tolist())
             signed_ndcg_at_50_values.extend(per_sample_signed_ndcg_at_50.tolist())
+            delta_cosine_values.extend(per_sample_delta_cosine.tolist())
+            delta_pearson_values.extend(per_sample_delta_pearson.tolist())
+            delta_spearman_values.extend(per_sample_delta_spearman.tolist())
+            delta_r2_vs_zero_values.extend(per_sample_delta_r2_vs_zero.tolist())
+            magnitude_ratio_values.extend(per_sample_magnitude_ratio.tolist())
 
             rows_needed = max(0, max_inspection_rows - len(inspection_rows))
             for row_idx in range(min(rows_needed, batch_rows)):
@@ -637,6 +711,11 @@ def evaluate_model_on_loader(
                     "sample_top50_deg_match_count": float(per_sample_top50_deg_match_count[row_idx]),
                     "sample_top50_deg_match_fraction": float(per_sample_top50_deg_match_fraction[row_idx]),
                     "sample_signed_ndcg_at_50": float(per_sample_signed_ndcg_at_50[row_idx]),
+                    "sample_delta_cosine": float(per_sample_delta_cosine[row_idx]),
+                    "sample_delta_pearson": float(per_sample_delta_pearson[row_idx]),
+                    "sample_delta_spearman": float(per_sample_delta_spearman[row_idx]),
+                    "sample_delta_r2_vs_zero": float(per_sample_delta_r2_vs_zero[row_idx]),
+                    "sample_magnitude_ratio": float(per_sample_magnitude_ratio[row_idx]),
                 }
                 for gene_offset, gene_id in enumerate(selected_gene_ids):
                     inspection_row[f"pred_{gene_id}"] = float(predicted_expression[row_idx, gene_offset].detach().cpu().item())
@@ -670,6 +749,11 @@ def evaluate_model_on_loader(
                         "top50_deg_match_count": float(per_sample_top50_deg_match_count[row_idx]),
                         "top50_deg_match_fraction": float(per_sample_top50_deg_match_fraction[row_idx]),
                         "signed_ndcg_at_50": float(per_sample_signed_ndcg_at_50[row_idx]),
+                        "delta_cosine": float(per_sample_delta_cosine[row_idx]),
+                        "delta_pearson": float(per_sample_delta_pearson[row_idx]),
+                        "delta_spearman": float(per_sample_delta_spearman[row_idx]),
+                        "delta_r2_vs_zero": float(per_sample_delta_r2_vs_zero[row_idx]),
+                        "magnitude_ratio": float(per_sample_magnitude_ratio[row_idx]),
                     }
                 )
 
@@ -678,6 +762,11 @@ def evaluate_model_on_loader(
     top50_deg_match_counts = np.asarray(top50_deg_match_counts, dtype=np.float64)
     top50_deg_match_fractions = np.asarray(top50_deg_match_fractions, dtype=np.float64)
     signed_ndcg_at_50_values = np.asarray(signed_ndcg_at_50_values, dtype=np.float64)
+    delta_cosine_values = np.asarray(delta_cosine_values, dtype=np.float64)
+    delta_pearson_values = np.asarray(delta_pearson_values, dtype=np.float64)
+    delta_spearman_values = np.asarray(delta_spearman_values, dtype=np.float64)
+    delta_r2_vs_zero_values = np.asarray(delta_r2_vs_zero_values, dtype=np.float64)
+    magnitude_ratio_values = np.asarray(magnitude_ratio_values, dtype=np.float64)
 
     metrics = {
         "split": split_name,
@@ -695,6 +784,14 @@ def evaluate_model_on_loader(
         "top50_deg_match_fraction_median": float(np.median(top50_deg_match_fractions)) if total_rows else float("nan"),
         "signed_ndcg_at_50_mean": float(np.mean(signed_ndcg_at_50_values)) if total_rows else float("nan"),
         "signed_ndcg_at_50_median": float(np.median(signed_ndcg_at_50_values)) if total_rows else float("nan"),
+        "delta_cosine_mean": float(np.mean(delta_cosine_values)) if total_rows else float("nan"),
+        "delta_pearson_mean": float(np.mean(delta_pearson_values)) if total_rows else float("nan"),
+        "delta_pearson_median": float(np.median(delta_pearson_values)) if total_rows else float("nan"),
+        "delta_spearman_mean": float(np.mean(delta_spearman_values)) if total_rows else float("nan"),
+        "delta_spearman_median": float(np.median(delta_spearman_values)) if total_rows else float("nan"),
+        "delta_r2_vs_zero_mean": float(np.mean(delta_r2_vs_zero_values)) if total_rows else float("nan"),
+        "delta_r2_vs_zero_median": float(np.median(delta_r2_vs_zero_values)) if total_rows else float("nan"),
+        "magnitude_ratio_mean": float(np.mean(magnitude_ratio_values)) if total_rows else float("nan"),
     }
     inspection_df = pd.DataFrame(inspection_rows)
     prediction_details_df = pd.DataFrame(prediction_detail_rows)
@@ -734,6 +831,41 @@ def build_loss_history_table(metrics_df):
     loss_history_df = pd.concat(history_frames, ignore_index=True)
     loss_history_df["epoch"] = loss_history_df["epoch"].astype(int)
     return loss_history_df.sort_values(["epoch", "split"], ignore_index=True)
+
+
+def write_performance_metrics(output_dir, tables, json_summaries=None):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    written_paths = {}
+
+    for table_name, table_df in tables.items():
+        if table_df is None or table_df.empty:
+            continue
+
+        csv_path = output_dir / f"{table_name}.csv"
+        json_path = output_dir / f"{table_name}.json"
+
+        table_df.to_csv(csv_path, index=False)
+        json_path.write_text(
+            json.dumps(table_df.to_dict(orient="records"), indent=2, default=str)
+        )
+
+        written_paths[f"{table_name}_csv_path"] = csv_path
+        written_paths[f"{table_name}_json_path"] = json_path
+
+    if json_summaries is None:
+        return written_paths
+
+    for summary_name, summary_payload in json_summaries.items():
+        if summary_payload is None:
+            continue
+
+        summary_path = output_dir / f"{summary_name}.json"
+        summary_path.write_text(json.dumps(summary_payload, indent=2, default=str))
+        written_paths[f"{summary_name}_json_path"] = summary_path
+
+    return written_paths
 
 
 def sample_prediction_details(prediction_details_df, sample_count, sample_strategy, random_seed):
@@ -824,6 +956,11 @@ def build_prediction_pair_embedding(model, dataset, sampled_prediction_details_d
                 "top50_deg_match_count": float(metadata_row["top50_deg_match_count"]),
                 "top50_deg_match_fraction": float(metadata_row["top50_deg_match_fraction"]),
                 "signed_ndcg_at_50": float(metadata_row["signed_ndcg_at_50"]),
+                "delta_cosine": float(metadata_row["delta_cosine"]),
+                "delta_pearson": float(metadata_row["delta_pearson"]),
+                "delta_spearman": float(metadata_row["delta_spearman"]),
+                "delta_r2_vs_zero": float(metadata_row["delta_r2_vs_zero"]),
+                "magnitude_ratio": float(metadata_row["magnitude_ratio"]),
                 "pair_distance_2d": pair_distance_2d,
             }
         )
@@ -835,6 +972,295 @@ def build_prediction_pair_embedding(model, dataset, sampled_prediction_details_d
         ignore_index=True,
     )
     return plot_df, pair_summary_df, explained_variance_ratio
+
+
+NULL_BASELINE_PREDICTORS = ("zero", "global_mean", "cell_line_mean")
+RETRIEVAL_LABEL_COLUMNS = {
+    "drug_blind": "drug",
+    "tumor_blind": "cell_line",
+    "mixed": "drug",
+}
+
+
+def resolve_retrieval_label_column(split_mode):
+    if split_mode not in RETRIEVAL_LABEL_COLUMNS:
+        raise ValueError(
+            f"Unsupported split_mode for retrieval: {split_mode!r}. "
+            f"Expected one of {sorted(RETRIEVAL_LABEL_COLUMNS)}."
+        )
+    return RETRIEVAL_LABEL_COLUMNS[split_mode]
+
+
+def compute_condition_retrieval(predicted_delta_np, target_delta_np, labels, top_ks=(1, 5), eps=1e-12):
+    predicted_delta_np = np.asarray(predicted_delta_np, dtype=np.float64)
+    target_delta_np = np.asarray(target_delta_np, dtype=np.float64)
+    labels = np.asarray(labels)
+
+    if predicted_delta_np.ndim != 2:
+        raise ValueError("predicted_delta_np must be 2D (n_samples, n_genes).")
+    if predicted_delta_np.shape != target_delta_np.shape:
+        raise ValueError(
+            f"predicted_delta_np shape {predicted_delta_np.shape} does not match "
+            f"target_delta_np shape {target_delta_np.shape}."
+        )
+    if labels.shape[0] != predicted_delta_np.shape[0]:
+        raise ValueError(
+            f"labels length {labels.shape[0]} does not match predicted_delta_np rows {predicted_delta_np.shape[0]}."
+        )
+
+    n_samples = int(predicted_delta_np.shape[0])
+    unique_labels = np.unique(labels)
+    n_labels = int(unique_labels.shape[0])
+
+    result = {
+        "n_samples": n_samples,
+        "n_labels": n_labels,
+        "mean_rank": float("nan"),
+        "median_rank": float("nan"),
+    }
+    for top_k in top_ks:
+        result[f"top{int(top_k)}"] = float("nan")
+        result[f"chance_top{int(top_k)}"] = float("nan") if n_labels == 0 else float(min(int(top_k), n_labels) / n_labels)
+
+    if n_samples == 0 or n_labels == 0:
+        return result
+
+    per_label_mean = np.stack(
+        [target_delta_np[labels == label].mean(axis=0) for label in unique_labels],
+        axis=0,
+    )
+
+    predicted_centered = predicted_delta_np - predicted_delta_np.mean(axis=1, keepdims=True)
+    label_centered = per_label_mean - per_label_mean.mean(axis=1, keepdims=True)
+
+    predicted_norm = np.sqrt((predicted_centered ** 2).sum(axis=1))
+    label_norm = np.sqrt((label_centered ** 2).sum(axis=1))
+
+    similarity = predicted_centered @ label_centered.T
+    denom = np.maximum(predicted_norm[:, None] * label_norm[None, :], eps)
+    similarity = similarity / denom
+
+    label_to_index = {label: idx for idx, label in enumerate(unique_labels.tolist())}
+    true_indices = np.array([label_to_index[label] for label in labels.tolist()], dtype=np.int64)
+
+    # Rank 1 = best. Use -similarity so argsort is descending; break ties deterministically.
+    sorted_label_indices = np.argsort(-similarity, axis=1, kind="stable")
+    rank_positions = np.empty_like(sorted_label_indices)
+    row_index = np.arange(n_samples)[:, None]
+    rank_positions[row_index, sorted_label_indices] = np.arange(n_labels)[None, :]
+    ranks = rank_positions[np.arange(n_samples), true_indices] + 1
+
+    result["mean_rank"] = float(ranks.mean())
+    result["median_rank"] = float(np.median(ranks))
+    for top_k in top_ks:
+        k_int = int(top_k)
+        k_effective = min(k_int, n_labels)
+        result[f"top{k_int}"] = float((ranks <= k_effective).mean())
+        result[f"chance_top{k_int}"] = float(k_effective / n_labels)
+    return result
+
+
+def _build_delta_summary_metrics(per_sample, split_name, n_samples, mann_whitney_alpha):
+    if n_samples <= 0:
+        nan_value = float("nan")
+        return {
+            "split": split_name,
+            "n_samples": 0,
+            "delta_mse": nan_value,
+            "delta_mae": nan_value,
+            "treated_cosine": nan_value,
+            "mann_whitney_u_median": nan_value,
+            "mann_whitney_pvalue_mean": nan_value,
+            "mann_whitney_pvalue_median": nan_value,
+            "mann_whitney_not_significant_fraction": nan_value,
+            "top50_deg_match_count_mean": nan_value,
+            "top50_deg_match_count_median": nan_value,
+            "top50_deg_match_fraction_mean": nan_value,
+            "top50_deg_match_fraction_median": nan_value,
+            "signed_ndcg_at_50_mean": nan_value,
+            "signed_ndcg_at_50_median": nan_value,
+            "delta_cosine_mean": nan_value,
+            "delta_pearson_mean": nan_value,
+            "delta_pearson_median": nan_value,
+            "delta_spearman_mean": nan_value,
+            "delta_spearman_median": nan_value,
+            "delta_r2_vs_zero_mean": nan_value,
+            "delta_r2_vs_zero_median": nan_value,
+            "magnitude_ratio_mean": nan_value,
+        }
+    return {
+        "split": split_name,
+        "n_samples": int(n_samples),
+        "delta_mse": float(per_sample["delta_mse"].mean()),
+        "delta_mae": float(per_sample["delta_mae"].mean()),
+        "treated_cosine": float(per_sample["treated_cosine"].mean()),
+        "mann_whitney_u_median": float(np.median(per_sample["mann_whitney_u"])),
+        "mann_whitney_pvalue_mean": float(np.mean(per_sample["mann_whitney_pvalue"])),
+        "mann_whitney_pvalue_median": float(np.median(per_sample["mann_whitney_pvalue"])),
+        "mann_whitney_not_significant_fraction": float(
+            np.mean(per_sample["mann_whitney_pvalue"] >= mann_whitney_alpha)
+        ),
+        "top50_deg_match_count_mean": float(np.mean(per_sample["top50_deg_match_count"])),
+        "top50_deg_match_count_median": float(np.median(per_sample["top50_deg_match_count"])),
+        "top50_deg_match_fraction_mean": float(np.mean(per_sample["top50_deg_match_fraction"])),
+        "top50_deg_match_fraction_median": float(np.median(per_sample["top50_deg_match_fraction"])),
+        "signed_ndcg_at_50_mean": float(np.mean(per_sample["signed_ndcg_at_50"])),
+        "signed_ndcg_at_50_median": float(np.median(per_sample["signed_ndcg_at_50"])),
+        "delta_cosine_mean": float(np.mean(per_sample["delta_cosine"])),
+        "delta_pearson_mean": float(np.mean(per_sample["delta_pearson"])),
+        "delta_pearson_median": float(np.median(per_sample["delta_pearson"])),
+        "delta_spearman_mean": float(np.mean(per_sample["delta_spearman"])),
+        "delta_spearman_median": float(np.median(per_sample["delta_spearman"])),
+        "delta_r2_vs_zero_mean": float(np.mean(per_sample["delta_r2_vs_zero"])),
+        "delta_r2_vs_zero_median": float(np.median(per_sample["delta_r2_vs_zero"])),
+        "magnitude_ratio_mean": float(np.mean(per_sample["magnitude_ratio"])),
+    }
+
+
+def _gather_split_arrays_from_loader(loader):
+    baseline_chunks = []
+    target_delta_chunks = []
+    cell_line_chunks = []
+    for batch in loader:
+        baseline_chunks.append(batch["baseline_expression"].detach().cpu().numpy())
+        target_delta_chunks.append(batch["target_delta"].detach().cpu().numpy())
+        cell_line_value = batch["cell_line"]
+        if isinstance(cell_line_value, (list, tuple)):
+            cell_line_chunks.extend(str(item) for item in cell_line_value)
+        else:
+            cell_line_chunks.extend(str(item) for item in list(cell_line_value))
+
+    if not target_delta_chunks:
+        raise ValueError("Loader produced no batches; cannot compute null baselines.")
+
+    baseline_np = np.concatenate(baseline_chunks, axis=0).astype(np.float32, copy=False)
+    target_delta_np = np.concatenate(target_delta_chunks, axis=0).astype(np.float32, copy=False)
+    cell_lines = np.asarray(cell_line_chunks, dtype=object)
+    return baseline_np, target_delta_np, cell_lines
+
+
+def _compute_null_baseline_rows(normalized_splits, mann_whitney_alpha, deg_top_k):
+    if "train" not in normalized_splits:
+        raise ValueError("normalized_splits must contain a 'train' entry to fit null baselines.")
+
+    train_baseline_np, train_target_delta_np, train_cell_lines = normalized_splits["train"]
+    if train_target_delta_np.shape[0] == 0:
+        raise ValueError("Train split has zero rows; cannot fit null baselines.")
+
+    global_mean_delta = train_target_delta_np.mean(axis=0).astype(np.float32, copy=False)
+
+    per_cell_line_mean_delta = {}
+    train_cell_lines_str = np.asarray([str(item) for item in train_cell_lines.tolist()])
+    for cell_line in np.unique(train_cell_lines_str):
+        mask = train_cell_lines_str == cell_line
+        per_cell_line_mean_delta[cell_line] = (
+            train_target_delta_np[mask].mean(axis=0).astype(np.float32, copy=False)
+        )
+
+    rows = []
+    for split_name in SPLIT_NAMES:
+        if split_name not in normalized_splits:
+            continue
+        baseline_np, target_delta_np, cell_lines = normalized_splits[split_name]
+        baseline_np_32 = baseline_np.astype(np.float32, copy=False)
+        target_delta_np_32 = target_delta_np.astype(np.float32, copy=False)
+        cell_lines_str = [str(item) for item in cell_lines.tolist()]
+        n_samples = int(target_delta_np_32.shape[0])
+
+        for predictor in NULL_BASELINE_PREDICTORS:
+            cell_line_mean_fell_back = False
+            if predictor == "zero":
+                predicted_delta_np = np.zeros_like(target_delta_np_32)
+            elif predictor == "global_mean":
+                predicted_delta_np = np.broadcast_to(
+                    global_mean_delta, target_delta_np_32.shape
+                ).copy()
+            else:
+                predicted_delta_np = np.empty_like(target_delta_np_32)
+                for row_idx, cell_line in enumerate(cell_lines_str):
+                    if cell_line in per_cell_line_mean_delta:
+                        predicted_delta_np[row_idx] = per_cell_line_mean_delta[cell_line]
+                    else:
+                        predicted_delta_np[row_idx] = global_mean_delta
+                        cell_line_mean_fell_back = True
+
+            per_sample = _compute_sklearn_per_sample_metrics(
+                predicted_delta_np=predicted_delta_np,
+                target_delta_np=target_delta_np_32,
+                baseline_np=baseline_np_32,
+                deg_top_k=deg_top_k,
+            )
+            row = _build_delta_summary_metrics(
+                per_sample=per_sample,
+                split_name=split_name,
+                n_samples=n_samples,
+                mann_whitney_alpha=mann_whitney_alpha,
+            )
+            row["predictor"] = predictor
+            if predictor == "cell_line_mean":
+                row["cell_line_mean_fell_back"] = bool(cell_line_mean_fell_back)
+            rows.append(row)
+    return rows
+
+
+def compute_null_baselines_from_arrays(splits, gene_ids=None, mann_whitney_alpha=0.05, deg_top_k=50):
+    del gene_ids  # Accepted for API symmetry with the loader variant; unused internally.
+
+    normalized_splits = {}
+    for split_name, payload in splits.items():
+        if not isinstance(payload, (list, tuple)) or len(payload) != 3:
+            raise ValueError(
+                f"splits[{split_name!r}] must be a 3-tuple of (baseline_np, target_delta_np, metadata_df)."
+            )
+        baseline_np, target_delta_np, metadata_df = payload
+        baseline_np = np.asarray(baseline_np)
+        target_delta_np = np.asarray(target_delta_np)
+        if baseline_np.shape != target_delta_np.shape:
+            raise ValueError(
+                f"splits[{split_name!r}] baseline_np shape {baseline_np.shape} does not match "
+                f"target_delta_np shape {target_delta_np.shape}."
+            )
+        if "cell_line" not in metadata_df.columns:
+            raise ValueError(
+                f"splits[{split_name!r}] metadata_df is missing required 'cell_line' column."
+            )
+        if len(metadata_df) != target_delta_np.shape[0]:
+            raise ValueError(
+                f"splits[{split_name!r}] metadata_df has {len(metadata_df)} rows but "
+                f"target_delta_np has {target_delta_np.shape[0]} rows."
+            )
+        cell_lines = metadata_df["cell_line"].astype(str).to_numpy()
+        normalized_splits[split_name] = (baseline_np, target_delta_np, cell_lines)
+
+    return _compute_null_baseline_rows(
+        normalized_splits,
+        mann_whitney_alpha=mann_whitney_alpha,
+        deg_top_k=deg_top_k,
+    )
+
+
+def compute_null_baselines_from_loaders(
+    train_loader,
+    val_loader,
+    test_loader,
+    gene_ids=None,
+    mann_whitney_alpha=0.05,
+    deg_top_k=50,
+):
+    del gene_ids  # Accepted for API symmetry with the arrays variant; unused internally.
+
+    loaders = {"train": train_loader, "val": val_loader, "test": test_loader}
+    normalized_splits = {}
+    for split_name, loader in loaders.items():
+        if loader is None:
+            continue
+        normalized_splits[split_name] = _gather_split_arrays_from_loader(loader)
+
+    return _compute_null_baseline_rows(
+        normalized_splits,
+        mann_whitney_alpha=mann_whitney_alpha,
+        deg_top_k=deg_top_k,
+    )
 
 
 def build_rf_training_arrays(preprocessor, examples_df):
@@ -897,6 +1323,11 @@ def _compute_sklearn_per_sample_metrics(predicted_delta_np, target_delta_np, bas
         top_k=deg_top_k,
     )
 
+    per_sample_delta_metric_arrays = _per_sample_delta_metrics(
+        predicted_delta_np,
+        target_delta_np,
+    )
+
     return {
         "predicted_expression": predicted_expression,
         "target_expression": target_expression,
@@ -909,6 +1340,11 @@ def _compute_sklearn_per_sample_metrics(predicted_delta_np, target_delta_np, bas
         "top50_deg_match_count": per_sample_top50_deg_match_count,
         "top50_deg_match_fraction": per_sample_top50_deg_match_fraction,
         "signed_ndcg_at_50": per_sample_signed_ndcg_at_50,
+        "delta_cosine": per_sample_delta_metric_arrays["delta_cosine"],
+        "delta_pearson": per_sample_delta_metric_arrays["delta_pearson"],
+        "delta_spearman": per_sample_delta_metric_arrays["delta_spearman"],
+        "delta_r2_vs_zero": per_sample_delta_metric_arrays["delta_r2_vs_zero"],
+        "magnitude_ratio": per_sample_delta_metric_arrays["magnitude_ratio"],
     }
 
 
@@ -979,6 +1415,11 @@ def evaluate_sklearn_predictions(
             "sample_top50_deg_match_count": float(per_sample["top50_deg_match_count"][row_idx]),
             "sample_top50_deg_match_fraction": float(per_sample["top50_deg_match_fraction"][row_idx]),
             "sample_signed_ndcg_at_50": float(per_sample["signed_ndcg_at_50"][row_idx]),
+            "sample_delta_cosine": float(per_sample["delta_cosine"][row_idx]),
+            "sample_delta_pearson": float(per_sample["delta_pearson"][row_idx]),
+            "sample_delta_spearman": float(per_sample["delta_spearman"][row_idx]),
+            "sample_delta_r2_vs_zero": float(per_sample["delta_r2_vs_zero"][row_idx]),
+            "sample_magnitude_ratio": float(per_sample["magnitude_ratio"][row_idx]),
         }
         for gene_offset, gene_id in enumerate(selected_gene_ids):
             inspection_row[f"pred_{gene_id}"] = float(predicted_expression_tensor[row_idx, gene_offset].item())
@@ -1007,6 +1448,11 @@ def evaluate_sklearn_predictions(
                 "top50_deg_match_count": float(per_sample["top50_deg_match_count"][row_idx]),
                 "top50_deg_match_fraction": float(per_sample["top50_deg_match_fraction"][row_idx]),
                 "signed_ndcg_at_50": float(per_sample["signed_ndcg_at_50"][row_idx]),
+                "delta_cosine": float(per_sample["delta_cosine"][row_idx]),
+                "delta_pearson": float(per_sample["delta_pearson"][row_idx]),
+                "delta_spearman": float(per_sample["delta_spearman"][row_idx]),
+                "delta_r2_vs_zero": float(per_sample["delta_r2_vs_zero"][row_idx]),
+                "magnitude_ratio": float(per_sample["magnitude_ratio"][row_idx]),
             }
         )
 
@@ -1026,6 +1472,14 @@ def evaluate_sklearn_predictions(
         "top50_deg_match_fraction_median": float(np.median(per_sample["top50_deg_match_fraction"])) if total_rows else float("nan"),
         "signed_ndcg_at_50_mean": float(np.mean(per_sample["signed_ndcg_at_50"])) if total_rows else float("nan"),
         "signed_ndcg_at_50_median": float(np.median(per_sample["signed_ndcg_at_50"])) if total_rows else float("nan"),
+        "delta_cosine_mean": float(np.mean(per_sample["delta_cosine"])) if total_rows else float("nan"),
+        "delta_pearson_mean": float(np.mean(per_sample["delta_pearson"])) if total_rows else float("nan"),
+        "delta_pearson_median": float(np.median(per_sample["delta_pearson"])) if total_rows else float("nan"),
+        "delta_spearman_mean": float(np.mean(per_sample["delta_spearman"])) if total_rows else float("nan"),
+        "delta_spearman_median": float(np.median(per_sample["delta_spearman"])) if total_rows else float("nan"),
+        "delta_r2_vs_zero_mean": float(np.mean(per_sample["delta_r2_vs_zero"])) if total_rows else float("nan"),
+        "delta_r2_vs_zero_median": float(np.median(per_sample["delta_r2_vs_zero"])) if total_rows else float("nan"),
+        "magnitude_ratio_mean": float(np.mean(per_sample["magnitude_ratio"])) if total_rows else float("nan"),
     }
     inspection_df = pd.DataFrame(inspection_rows)
     prediction_details_df = pd.DataFrame(prediction_detail_rows)
@@ -1104,6 +1558,11 @@ def build_sklearn_prediction_pair_embedding(
                 "top50_deg_match_count": float(metadata_row["top50_deg_match_count"]),
                 "top50_deg_match_fraction": float(metadata_row["top50_deg_match_fraction"]),
                 "signed_ndcg_at_50": float(metadata_row["signed_ndcg_at_50"]),
+                "delta_cosine": float(metadata_row["delta_cosine"]),
+                "delta_pearson": float(metadata_row["delta_pearson"]),
+                "delta_spearman": float(metadata_row["delta_spearman"]),
+                "delta_r2_vs_zero": float(metadata_row["delta_r2_vs_zero"]),
+                "magnitude_ratio": float(metadata_row["magnitude_ratio"]),
                 "pair_distance_2d": pair_distance_2d,
             }
         )
