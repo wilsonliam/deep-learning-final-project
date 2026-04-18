@@ -1,0 +1,37 @@
+Metadata-Version: 2.4
+Name: tahoe-pseudobulk
+Version: 0.1.0
+Summary: Tahoe-100M pseudobulk preprocessing and export utilities
+Requires-Python: >=3.10
+Description-Content-Type: text/plain
+Requires-Dist: anndata
+Requires-Dist: datasets
+Requires-Dist: h5py
+Requires-Dist: ipykernel>=7.2.0
+Requires-Dist: lightning
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: pyarrow
+Requires-Dist: rdkit
+Requires-Dist: requests
+Requires-Dist: scikit-learn
+Requires-Dist: scipy
+Requires-Dist: seaborn
+Requires-Dist: torch
+Requires-Dist: torchinfo>=1.8.0
+
+Problem Statement: Address the difficulties in predicting post-perturbation gene expression profiles given a primary (control) gene expression state, context (chemical perturbation cell type, etc), specifically those related to cell-line confounding and experimental variation. 
+Objectives:
+1) Train an adversarial deconfounding autoencoder (ADAE; improved generalizability/performance in noisy contexts) model to predict gene expression profiles given a drug perturbation,context, and baseline state.
+2) Improve/evaluate generalizability to held-out drugs/cell lines.
+3) Evaluate biological relevancy with gene and pathway level metrics
+4) Test whether learned embeddings group drugs by biological function. 
+
+Drug perturbation (and RNASeq in general; single cell/bulk/otherwise) are notoriously noisy data, and the feature space is highly interactive (gene-gene interactions). Deep learning is thusly appropriate to address this problem.
+
+Datasets: Tahoe100 (training; initial validation) and SciPlex (secondary validation) 
+
+References:
+https://academic.oup.com/bioinformatics/article/36/Supplement_2/i573/6055930
+https://www.biorxiv.org/content/10.1101/2025.02.20.639398v1
+https://maayanlab.cloud/Harmonizome/dataset/Sci-Plex+Drug+Perturbation+Signatures

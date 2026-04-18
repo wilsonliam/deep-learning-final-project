@@ -8,6 +8,7 @@ dependencies = [
   "anndata",
   "datasets",
   "h5py",
+  "ipykernel>=7.2.0",
   "lightning",
   "numpy",
   "pandas",
@@ -18,8 +19,17 @@ dependencies = [
   "scipy",
   "seaborn",
   "torch",
+  "torchinfo>=1.8.0",
 ]
 
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = [
+  "tahoe_pseudobulk",
+  "tahoe_gene_filters",
+  "pseudobulk_tahoe100",
+  "load_cell_line_collection",
+]
