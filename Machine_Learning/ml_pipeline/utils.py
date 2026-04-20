@@ -125,6 +125,13 @@ def validate_split_config(split_mode, split_fractions):
         raise ValueError(f"Split fractions must sum to 1.0; got {total_fraction}")
 
 
+def validate_preprocessing_config(target_mode, preprocess_batch_size):
+    if target_mode not in SUPPORTED_TARGET_MODES:
+        raise ValueError(f"Unsupported TARGET_MODE: {target_mode}")
+    if int(preprocess_batch_size) <= 0:
+        raise ValueError("PREPROCESS_BATCH_SIZE must be positive.")
+
+
 def validate_training_config(
     target_mode,
     preprocess_batch_size,
@@ -133,10 +140,7 @@ def validate_training_config(
     max_epochs,
     early_stopping_patience,
 ):
-    if target_mode not in SUPPORTED_TARGET_MODES:
-        raise ValueError(f"Unsupported TARGET_MODE: {target_mode}")
-    if int(preprocess_batch_size) <= 0:
-        raise ValueError("PREPROCESS_BATCH_SIZE must be positive.")
+    validate_preprocessing_config(target_mode, preprocess_batch_size)
     if float(learning_rate) <= 0:
         raise ValueError("LEARNING_RATE must be positive.")
     if float(weight_decay) < 0:
@@ -389,9 +393,15 @@ def move_batch_to_device(batch, device):
     return moved_batch
 
 
+def _to_numpy_array(array_like):
+    if isinstance(array_like, torch.Tensor):
+        return array_like.detach().cpu().numpy()
+    return np.asarray(array_like)
+
+
 def compute_mann_whitney_batch(predicted_expression, target_expression):
-    predicted_expression_np = predicted_expression.detach().cpu().numpy()
-    target_expression_np = target_expression.detach().cpu().numpy()
+    predicted_expression_np = _to_numpy_array(predicted_expression)
+    target_expression_np = _to_numpy_array(target_expression)
     mann_whitney_u_values = []
     mann_whitney_pvalues = []
 
@@ -412,8 +422,8 @@ def compute_mann_whitney_batch(predicted_expression, target_expression):
 
 
 def compute_topk_deg_metrics_batch(predicted_delta, target_delta, top_k=50):
-    predicted_delta_np = predicted_delta.detach().cpu().numpy()
-    target_delta_np = target_delta.detach().cpu().numpy()
+    predicted_delta_np = _to_numpy_array(predicted_delta)
+    target_delta_np = _to_numpy_array(target_delta)
     topk_match_counts = []
     topk_match_fractions = []
     signed_ndcg_at_k_values = []
@@ -451,6 +461,130 @@ def compute_topk_deg_metrics_batch(predicted_delta, target_delta, top_k=50):
         np.asarray(topk_match_fractions, dtype=np.float64),
         np.asarray(signed_ndcg_at_k_values, dtype=np.float64),
     )
+
+
+def evaluate_predictions_from_arrays(
+    predicted_delta,
+    baseline_expression,
+    target_delta,
+    split_name,
+    gene_ids,
+    metadata_df,
+    max_inspection_rows=3,
+    n_inspection_genes=5,
+    mann_whitney_alpha=0.05,
+    deg_top_k=50,
+):
+    predicted_delta_np = _to_numpy_array(predicted_delta).astype(np.float32, copy=False)
+    baseline_expression_np = _to_numpy_array(baseline_expression).astype(np.float32, copy=False)
+    target_delta_np = _to_numpy_array(target_delta).astype(np.float32, copy=False)
+
+    if predicted_delta_np.shape != target_delta_np.shape:
+        raise ValueError("predicted_delta and target_delta must have the same shape.")
+    if baseline_expression_np.shape != target_delta_np.shape:
+        raise ValueError("baseline_expression and target_delta must have the same shape.")
+
+    metadata_frame = metadata_df.reset_index(drop=True).copy()
+    n_rows = int(predicted_delta_np.shape[0])
+    if len(metadata_frame) != n_rows:
+        raise ValueError("metadata_df row count must align with prediction arrays.")
+    if "dataset_index" not in metadata_frame.columns:
+        metadata_frame.insert(0, "dataset_index", np.arange(n_rows, dtype=int))
+
+    predicted_expression_np = baseline_expression_np + predicted_delta_np
+    target_expression_np = baseline_expression_np + target_delta_np
+    selected_gene_ids = list(gene_ids[:n_inspection_genes])
+
+    per_sample_delta_mse = np.mean((predicted_delta_np - target_delta_np) ** 2, axis=1, dtype=np.float64)
+    per_sample_delta_mae = np.mean(np.abs(predicted_delta_np - target_delta_np), axis=1, dtype=np.float64)
+    per_sample_treated_mse = np.mean((predicted_expression_np - target_expression_np) ** 2, axis=1, dtype=np.float64)
+
+    numerator = np.sum(predicted_expression_np * target_expression_np, axis=1, dtype=np.float64)
+    predicted_norm = np.linalg.norm(predicted_expression_np, axis=1)
+    target_norm = np.linalg.norm(target_expression_np, axis=1)
+    cosine_denominator = np.clip(predicted_norm * target_norm, a_min=MIN_STANDARD_DEVIATION, a_max=None)
+    per_sample_treated_cosine = numerator / cosine_denominator
+
+    per_sample_mann_whitney_u, per_sample_mann_whitney_pvalue = compute_mann_whitney_batch(
+        predicted_expression_np,
+        target_expression_np,
+    )
+    (
+        per_sample_top50_deg_match_count,
+        per_sample_top50_deg_match_fraction,
+        per_sample_signed_ndcg_at_50,
+    ) = compute_topk_deg_metrics_batch(
+        predicted_delta_np,
+        target_delta_np,
+        top_k=deg_top_k,
+    )
+
+    metrics = {
+        "split": split_name,
+        "n_samples": n_rows,
+        "delta_mse": float(np.mean(per_sample_delta_mse)) if n_rows else float("nan"),
+        "delta_mae": float(np.mean(per_sample_delta_mae)) if n_rows else float("nan"),
+        "treated_cosine": float(np.mean(per_sample_treated_cosine)) if n_rows else float("nan"),
+        "mann_whitney_u_median": float(np.median(per_sample_mann_whitney_u)) if n_rows else float("nan"),
+        "mann_whitney_pvalue_mean": float(np.mean(per_sample_mann_whitney_pvalue)) if n_rows else float("nan"),
+        "mann_whitney_pvalue_median": float(np.median(per_sample_mann_whitney_pvalue)) if n_rows else float("nan"),
+        "mann_whitney_not_significant_fraction": float(np.mean(per_sample_mann_whitney_pvalue >= mann_whitney_alpha)) if n_rows else float("nan"),
+        "top50_deg_match_count_mean": float(np.mean(per_sample_top50_deg_match_count)) if n_rows else float("nan"),
+        "top50_deg_match_count_median": float(np.median(per_sample_top50_deg_match_count)) if n_rows else float("nan"),
+        "top50_deg_match_fraction_mean": float(np.mean(per_sample_top50_deg_match_fraction)) if n_rows else float("nan"),
+        "top50_deg_match_fraction_median": float(np.median(per_sample_top50_deg_match_fraction)) if n_rows else float("nan"),
+        "signed_ndcg_at_50_mean": float(np.mean(per_sample_signed_ndcg_at_50)) if n_rows else float("nan"),
+        "signed_ndcg_at_50_median": float(np.median(per_sample_signed_ndcg_at_50)) if n_rows else float("nan"),
+    }
+
+    inspection_rows = []
+    for row_idx in range(min(max_inspection_rows, n_rows)):
+        inspection_row = {
+            "split": split_name,
+            "condition_key": metadata_frame.loc[row_idx, "condition_key"],
+            "cell_line": metadata_frame.loc[row_idx, "cell_line"],
+            "drug": metadata_frame.loc[row_idx, "drug"],
+            "concentration": float(metadata_frame.loc[row_idx, "concentration"]),
+            "sample_delta_mse": float(per_sample_delta_mse[row_idx]),
+            "sample_treated_cosine": float(per_sample_treated_cosine[row_idx]),
+            "sample_mann_whitney_u": float(per_sample_mann_whitney_u[row_idx]),
+            "sample_mann_whitney_pvalue": float(per_sample_mann_whitney_pvalue[row_idx]),
+            "sample_top50_deg_match_count": float(per_sample_top50_deg_match_count[row_idx]),
+            "sample_top50_deg_match_fraction": float(per_sample_top50_deg_match_fraction[row_idx]),
+            "sample_signed_ndcg_at_50": float(per_sample_signed_ndcg_at_50[row_idx]),
+        }
+        for gene_offset, gene_id in enumerate(selected_gene_ids):
+            inspection_row[f"pred_{gene_id}"] = float(predicted_expression_np[row_idx, gene_offset])
+            inspection_row[f"target_{gene_id}"] = float(target_expression_np[row_idx, gene_offset])
+        inspection_rows.append(inspection_row)
+
+    prediction_detail_rows = []
+    for row_idx in range(n_rows):
+        metadata_row = metadata_frame.iloc[row_idx]
+        prediction_detail_rows.append(
+            {
+                "split": split_name,
+                "dataset_index": int(metadata_row["dataset_index"]),
+                "condition_key": metadata_row["condition_key"],
+                "cell_line": metadata_row["cell_line"],
+                "cell_name": metadata_row["cell_name"],
+                "organ": metadata_row["organ"],
+                "drug": metadata_row["drug"],
+                "concentration": float(metadata_row["concentration"]),
+                "concentration_unit": metadata_row["concentration_unit"],
+                "delta_mse": float(per_sample_delta_mse[row_idx]),
+                "delta_mae": float(per_sample_delta_mae[row_idx]),
+                "treated_mse": float(per_sample_treated_mse[row_idx]),
+                "treated_cosine": float(per_sample_treated_cosine[row_idx]),
+                "mann_whitney_u": float(per_sample_mann_whitney_u[row_idx]),
+                "mann_whitney_pvalue": float(per_sample_mann_whitney_pvalue[row_idx]),
+                "top50_deg_match_count": float(per_sample_top50_deg_match_count[row_idx]),
+                "top50_deg_match_fraction": float(per_sample_top50_deg_match_fraction[row_idx]),
+                "signed_ndcg_at_50": float(per_sample_signed_ndcg_at_50[row_idx]),
+            }
+        )
+
+    return metrics, pd.DataFrame(inspection_rows), pd.DataFrame(prediction_detail_rows)
 
 
 def evaluate_model_on_loader(
@@ -668,11 +802,40 @@ def build_prediction_pair_embedding(model, dataset, sampled_prediction_details_d
         predicted_delta = model(model_input_batch)
         predicted_expression = baseline_expression + predicted_delta
         actual_expression = baseline_expression + target_delta
+    return build_prediction_pair_embedding_from_arrays(
+        predicted_expression=predicted_expression.detach().cpu().numpy(),
+        actual_expression=actual_expression.detach().cpu().numpy(),
+        sampled_prediction_details_df=sampled_prediction_details_df,
+        embedding_method=embedding_method,
+        n_components=n_components,
+        random_seed=random_seed,
+    )
 
-    predicted_expression_np = predicted_expression.detach().cpu().numpy()
-    actual_expression_np = actual_expression.detach().cpu().numpy()
-    combined_expression_np = np.concatenate([actual_expression_np, predicted_expression_np], axis=0)
-    embedding_model = PCA(n_components=int(n_components), svd_solver="full")
+
+def build_prediction_pair_embedding_from_arrays(
+    predicted_expression,
+    actual_expression,
+    sampled_prediction_details_df,
+    embedding_method,
+    n_components,
+    random_seed,
+):
+    if embedding_method != "pca":
+        raise ValueError(f"Unsupported embedding method: {embedding_method}")
+    if sampled_prediction_details_df.empty:
+        raise ValueError("No sampled prediction details were provided for embedding.")
+
+    predicted_expression_np = _to_numpy_array(predicted_expression).astype(np.float32, copy=False)
+    actual_expression_np = _to_numpy_array(actual_expression).astype(np.float32, copy=False)
+    if predicted_expression_np.shape != actual_expression_np.shape:
+        raise ValueError("predicted_expression and actual_expression must have the same shape.")
+
+    dataset_indices = sampled_prediction_details_df["dataset_index"].to_numpy(np.int64)
+    sampled_predicted_expression = predicted_expression_np[dataset_indices]
+    sampled_actual_expression = actual_expression_np[dataset_indices]
+
+    combined_expression_np = np.concatenate([sampled_actual_expression, sampled_predicted_expression], axis=0)
+    embedding_model = PCA(n_components=int(n_components), svd_solver="full", random_state=int(random_seed))
     embedded_points = embedding_model.fit_transform(combined_expression_np)
 
     n_pairs = len(sampled_prediction_details_df)

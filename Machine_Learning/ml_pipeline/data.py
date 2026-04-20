@@ -223,6 +223,32 @@ class PreparedTreatmentDataset(Dataset):
             "concentration_unit": self.concentration_units[idx],
         }
 
+    def materialize(self):
+        dataset_indices = torch.arange(len(self.examples_df), dtype=torch.long)
+        baseline_expression = self.preprocessor.dmso_target_expression_lookup[self.baseline_indices]
+        target_expression = self.preprocessor.treatment_expression_lookup[self.target_indices]
+        target_delta = target_expression - baseline_expression
+        gene_features = self.preprocessor.normalized_dmso_input_expression_lookup[self.baseline_indices]
+        drug_features = self.preprocessor.fingerprint_lookup[self.fingerprint_indices]
+        dose_feature = self.scaled_doses.unsqueeze(1)
+        input_features = torch.cat([gene_features, drug_features, dose_feature], dim=1)
+
+        metadata_df = self.examples_df.copy()
+        metadata_df.insert(0, "dataset_index", dataset_indices.numpy())
+
+        return {
+            "dataset_index": dataset_indices,
+            "input_features": input_features,
+            "gene_features": gene_features,
+            "drug_features": drug_features,
+            "dose_feature": dose_feature,
+            "baseline_expression": baseline_expression,
+            "target_expression": target_expression,
+            "target_delta": target_delta,
+            "concentration": self.concentrations.clone(),
+            "metadata_df": metadata_df,
+        }
+
 
 class DrugResponseDataModule(L.LightningDataModule):
     def __init__(
@@ -284,3 +310,17 @@ class DrugResponseDataModule(L.LightningDataModule):
 
 
 RidgeResponseDataModule = DrugResponseDataModule
+
+
+def materialize_prepared_dataset(prepared_dataset, as_numpy=False):
+    materialized = prepared_dataset.materialize()
+    if not as_numpy:
+        return materialized
+
+    numpy_materialized = {}
+    for key, value in materialized.items():
+        if isinstance(value, torch.Tensor):
+            numpy_materialized[key] = value.detach().cpu().numpy()
+        else:
+            numpy_materialized[key] = value.copy() if hasattr(value, "copy") else value
+    return numpy_materialized
